@@ -4,45 +4,34 @@
 
 ### 1. Ingredient processing as a terminal command, no notebooks
 
-Move the logic from `ingredient_processing.ipynb` into the package as CLI subcommands next to
-`crawl` / `probe` / `stats` / `export` in `src/recipe_crawler/cli.py`, settings in `config.toml`:
+Done (see README "Ingredient processing"): `lines`, `process`, `map` (incremental, `--full`), `stats`
+(progress, quota per key fingerprint, next reset), clean shutdown, `--log-file`, tests with a fake client.
+Also done from the first-run fixes: key fingerprints in the usage log (old line-index records are still
+counted), `UNIT_FIX` additions (`ek`, `pl`, `hrst`, `tk`, `cs`, `ks`/`stk`/`st`, `tbs`/`tbl`), amount cap,
+original spelling sent to the model (`ingredient_lines.original`) plus a t / T line in the prompt.
 
-- `recipe-crawler lines`: collect new distinct ingredient lines into `ingredient_lines` (step 1 of the notebook).
-- `recipe-crawler process`: send to-do lines to Gemini until every key has used up today's quota, then exit
-  (step 2). Options for keys file, models, batch size, pace, max requests.
-- `recipe-crawler map`: rebuild `recipe_ingredients` with the local unit cleanup (step 3). Ideally incremental
-  (only recipes that are new or whose lines just got done) instead of a full rebuild.
-- `recipe-crawler stats` should also show ingredient progress and today's quota per key.
-- Clean shutdown on Ctrl-C / SIGTERM (finish requests in flight, save), like `crawl` already does.
-- Logging to a file instead of print, so a scheduled run can be checked afterwards.
-- Tests with a fake Gemini client (503, 429, bad JSON, missing lines, quota pauses), like the offline test used
-  while building the notebook.
+Still open:
 
-Lessons from the first run to keep:
+- Names are not standardized yet: "panko" / "panko breadcrumbs", "coriander" / "cilantro",
+  "scallion" / "spring onion". The `ingredient_names` table (name -> canonical) exists and `map` applies it;
+  `recipe-crawler names` is only a stub. Next: merge the distinct *names* (far fewer than lines, so cheap) with
+  Gemini into one canonical name each, then `map --full`.
+- "5 t cream" and "5 T cream" still share one lowercase key, so they get one answer (from the most common
+  spelling). If that matters, keep the case of a standalone `t` / `T` in the key (re-queues only those lines).
+- Check the t / T prompt line with `gemini_quality_test.ipynb` before relying on it.
+
+Lessons from the first run (still valid):
 
 - Prompt and schema from the notebook (`en` field, "never spoon", unit rules), validated with
   `gemini_quality_test.ipynb`: ~0.1% untranslated.
 - 503 (overloaded) requests **do** count towards the 500/day (seen in AI Studio, 2026-10-29). ~20% of requests
   were 503 on the first evening.
-- The 500/day is per project (confirmed 2026-10-29: a second project on an account whose first project was
-  used up ran normally). But 11 projects on one account sending 4 requests each at the same time all got 429
-  within minutes, so there seems to be an additional short-term (per minute) limit per account. Ramp up slowly
-  and stagger the keys instead of starting all at once.
-- Identify keys in the usage log by a fingerprint (e.g. first 8 chars of a sha256), not by line number in
-  `gemini_keys.txt`, so editing the file does not mix up the counts.
+- The 500/day is per project (confirmed 2026-10-29). But 11 projects on one account sending 4 requests each at
+  the same time all got 429 within minutes, so there seems to be an additional short-term (per minute) limit
+  per account. Ramp up slowly and stagger the keys instead of starting all at once.
 - Most common lines first: the top ~52K distinct lines covered half of all recipe lines.
 - Measured: ~15 input + ~28 output tokens per line, ~786 tokens prompt overhead, ~55 s per 650-line request,
   0 thinking tokens at `minimal`.
-
-Quality fixes found in the first run (checked 2026-10-29 on ~496K done lines, ~0.2% untranslated):
-
-- `UNIT_FIX` in step 3 is missing `pl` (Czech polévková lžíce) -> tbsp and `hrst` -> handful.
-- Lowercasing the lines before sending loses `t` (teaspoon) vs `T` (tablespoon) in English recipes:
-  "5 t cream" came back as cup. Send the original case (deduplicate on the lowercase key, but send one original
-  spelling), or at least keep the case of a standalone `t`/`T`.
-- Names are not standardized yet: "panko" / "panko breadcrumbs", "coriander" / "cilantro",
-  "scallion" / "spring onion". Add a step that merges the distinct *names* (far fewer than lines, so cheap) into one
-  canonical name each, e.g. a `ingredient_names` table name -> canonical, applied in `map`.
 
 ### 2. Crawl only as much per day as can be processed
 

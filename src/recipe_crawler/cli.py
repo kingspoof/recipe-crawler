@@ -5,6 +5,9 @@
     uv run recipe-crawler crawl -d www.example.com   # just one site
     uv run recipe-crawler stats
     uv run recipe-crawler export recipes.jsonl --dedupe
+    uv run recipe-crawler lines                      # ingredient processing: collect lines,
+    uv run recipe-crawler process                    #   send them to Gemini until today's quota is used,
+    uv run recipe-crawler map                        #   map the results back to the recipes
 """
 
 from __future__ import annotations
@@ -14,12 +17,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import signal
 import sys
 from collections import Counter
 from urllib.parse import urlsplit
 
+from . import gemini, ingredients
 from .config import Settings, Site, load_config
 from .crawler import Crawler, DomainWorker
 from .db import DB
@@ -182,6 +187,11 @@ def cmd_stats(settings: Settings, args: argparse.Namespace) -> None:
     for col in ("site_region", "site_country", "language"):
         parts = ", ".join(f"{r['key']}: {r['n']}" for r in db.stats_by(col)[:30])
         print(f"by {col}: {parts}")
+    print("\ningredient lines:")
+    print("\n".join(ingredients.progress(db.conn)))
+    cfg = settings.ingredients
+    keys = gemini.load_keys(cfg.keys_file) if cfg.keys_file.exists() else []
+    print("\n".join(ingredients.quota_report(cfg, keys)))
     db.close()
 
 
@@ -213,6 +223,77 @@ def cmd_export(settings: Settings, args: argparse.Namespace) -> None:
     db.close()
 
 
+# --------------------------------------------------------------------------- ingredients
+
+
+def cmd_lines(settings: Settings, args: argparse.Namespace) -> None:
+    db = DB(settings.db_path)
+    ingredients.collect_lines(db.conn, settings.ingredients)
+    db.close()
+
+
+def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
+    cfg = settings.ingredients
+    for name in ("batch_size", "rpm"):
+        if getattr(args, name):
+            setattr(cfg, name, getattr(args, name))
+    if args.model:
+        cfg.models = args.model
+    keys_file = args.keys or cfg.keys_file
+    if not os.path.exists(keys_file):
+        raise SystemExit(f"No keys file {keys_file}: one Gemini API key per line, one key per project.")
+    keys = gemini.load_keys(keys_file)
+    usage = gemini.UsageLog(cfg.usage_log)
+    used = usage.used_today(keys)
+    db = DB(settings.db_path)
+    if args.dry_run:  # no migrations, no requests, no usage records
+        todo = ingredients.todo_lines(db.conn)
+        db.close()
+        print(f"{len(todo):,} lines to do = {-(-len(todo) // cfg.batch_size):,} requests of {cfg.batch_size}")
+        for k in keys:
+            for m in cfg.models:
+                print(f"  lane {gemini.fingerprint(k)}/{m}: {used[gemini.fingerprint(k), m]}/{cfg.rpd or '-'} used today")
+        first = [line.text for line in todo[:cfg.batch_size]]
+        print(f"first request ({len(first)} lines, prompt {len(gemini.PROMPT):,} chars):")
+        for i, text in enumerate(first[:20]):
+            print(f"  [{i}, {json.dumps(text, ensure_ascii=False)}]")
+        if len(first) > 20:
+            print(f"  ... {len(first) - 20} more")
+        if args.verbose:
+            print(gemini.PROMPT)
+        return
+    ingredients.ensure_schema(db.conn)
+    lanes = [gemini.Lane(k, gemini.GeminiClient(k), m, used[gemini.fingerprint(k), m], cfg.rpd)
+             for m in cfg.models for k in keys]
+    processor = gemini.Processor(cfg, lanes, usage, ingredients.make_save(db.conn), max_requests=args.max_requests)
+
+    def stop(*_: object) -> None:
+        if processor.stopping:
+            logging.error("Aborting without waiting for the requests in flight.")
+            os._exit(1)  # the worker threads would keep the interpreter alive; saved data is already committed
+        logging.warning("Stopping: waiting for the requests in flight and saving them (Ctrl+C again to abort)...")
+        processor.stop()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        processor.run(ingredients.todo_lines(db.conn))
+    finally:
+        db.close()
+
+
+def cmd_map(settings: Settings, args: argparse.Namespace) -> None:
+    db = DB(settings.db_path)
+    ingredients.map_ingredients(db.conn, settings.ingredients, full=args.full)
+    db.close()
+
+
+def cmd_names(settings: Settings, args: argparse.Namespace) -> None:
+    db = DB(settings.db_path)
+    print("\n".join(ingredients.names_report(db.conn)))
+    db.close()
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -220,6 +301,7 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="recipe-crawler", description="Polite schema.org recipe crawler")
     p.add_argument("-c", "--config", default="config.toml")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--log-file", help="also write the log to this file (appends)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("probe", help="check whether sites expose crawlable schema.org recipes")
@@ -236,7 +318,7 @@ def main(argv: list[str] | None = None) -> None:
         if name == "discover":
             sp.add_argument("--force", action="store_true", help="re-read sitemaps even if done before")
 
-    sub.add_parser("stats", help="show crawl progress")
+    sub.add_parser("stats", help="show crawl and ingredient progress, today's Gemini quota")
 
     sp = sub.add_parser("export", help="export recipes as JSON Lines")
     sp.add_argument("output")
@@ -244,16 +326,38 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--raw", action="store_true", help="include the original JSON-LD")
     sp.add_argument("--require-instructions", action="store_true")
 
+    sub.add_parser("lines", help="collect the distinct ingredient lines into ingredient_lines")
+
+    sp = sub.add_parser("process", help="send to-do ingredient lines to Gemini until today's quota is used up")
+    sp.add_argument("--keys", help="keys file (default: ingredients.keys_file)")
+    sp.add_argument("--model", action="append", help="model (repeatable, default: ingredients.models)")
+    sp.add_argument("--batch-size", type=int, help="lines per request")
+    sp.add_argument("--rpm", type=int, help="requests per minute per lane")
+    sp.add_argument("--max-requests", type=int, help="stop after this many requests in total (for testing)")
+    sp.add_argument("--dry-run", action="store_true", help="only print what it would send")
+
+    sp = sub.add_parser("map", help="map processed lines back to recipe_ingredients (incremental)")
+    sp.add_argument("--full", action="store_true", help="drop and rebuild recipe_ingredients")
+
+    sub.add_parser("names", help="(next step, stub) standardize ingredient names via ingredient_names")
+
     args = p.parse_args(argv)
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=handlers,
     )
+    if args.log_file:  # a file is read days later: full date
+        handlers[1].setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("google_genai").setLevel(logging.WARNING)
     if args.cmd == "probe":
         logging.getLogger("crawler").setLevel(logging.ERROR)
-    settings = load_config(args.config)
+    settings = load_config(args.config, require_contact=args.cmd in ("probe", "discover", "crawl"))
 
     if args.cmd == "probe":
         cmd_probe(settings, args)
@@ -265,3 +369,11 @@ def main(argv: list[str] | None = None) -> None:
         cmd_stats(settings, args)
     elif args.cmd == "export":
         cmd_export(settings, args)
+    elif args.cmd == "lines":
+        cmd_lines(settings, args)
+    elif args.cmd == "process":
+        cmd_process(settings, args)
+    elif args.cmd == "map":
+        cmd_map(settings, args)
+    elif args.cmd == "names":
+        cmd_names(settings, args)

@@ -38,6 +38,24 @@ class Site:
 
 
 @dataclass
+class IngredientSettings:
+    """Gemini ingredient processing ([ingredients] in config.toml), defaults from ingredient_processing.ipynb."""
+
+    models: list[str] = field(default_factory=lambda: ["gemini-3.5-flash-lite"])  # one lane per key x model
+    thinking_level: str = "minimal"
+    batch_size: int = 650  # lines per request: ~18.5K output tokens
+    max_output_tokens: int = 32768
+    max_line_chars: int = 200  # longer lines are almost always prose: skipped (status -2)
+    max_attempts: int = 2  # a line the model leaves out this often is marked failed (status -1)
+    rpd: int = 500  # requests per day per key x model (free tier); 0 = no own limit
+    rpm: int = 14  # our own pace per lane (the free tier allows 15)
+    in_flight: int = 200  # requests at the same time per lane
+    stagger: float = 5.0  # seconds between the first request of each lane
+    usage_log: Path = Path("data.nosync/gemini_usage.jsonl")
+    keys_file: Path = Path("gemini_keys.txt")  # one key per line, one key per Google Cloud project
+
+
+@dataclass
 class Settings:
     user_agent: str
     db_path: Path
@@ -50,6 +68,7 @@ class Settings:
     timeout: float = 30.0
     max_attempts: int = 3
     sites: list[Site] = field(default_factory=list)
+    ingredients: IngredientSettings = field(default_factory=IngredientSettings)
 
     def site(self, domain: str) -> Site:
         for s in self.sites:
@@ -62,12 +81,31 @@ def _regex(value: str | None) -> re.Pattern[str] | None:
     return re.compile(value, re.IGNORECASE) if value else None
 
 
-def load_config(path: str | Path = "config.toml") -> Settings:
+def _ingredients(data: dict, base: Path) -> IngredientSettings:
+    d = IngredientSettings()
+    return IngredientSettings(
+        models=list(data.get("models", d.models)),
+        thinking_level=data.get("thinking_level", d.thinking_level),
+        batch_size=int(data.get("batch_size", d.batch_size)),
+        max_output_tokens=int(data.get("max_output_tokens", d.max_output_tokens)),
+        max_line_chars=int(data.get("max_line_chars", d.max_line_chars)),
+        max_attempts=int(data.get("max_attempts", d.max_attempts)),
+        rpd=int(data.get("rpd", d.rpd)),
+        rpm=int(data.get("rpm", d.rpm)),
+        in_flight=int(data.get("in_flight", d.in_flight)),
+        stagger=float(data.get("stagger", d.stagger)),
+        usage_log=base / data.get("usage_log", d.usage_log),
+        keys_file=base / data.get("keys_file", d.keys_file),
+    )
+
+
+def load_config(path: str | Path = "config.toml", require_contact: bool = True) -> Settings:
+    """require_contact: only commands that send requests to recipe sites (crawl, discover, probe) need one."""
     path = Path(path)
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     c = data.get("crawler", {})
     contact = c.get("contact", "").strip()
-    if not contact or "CHANGE-ME" in contact or "example" in contact:
+    if require_contact and (not contact or "CHANGE-ME" in contact or "example" in contact):
         raise SystemExit(
             f"Please set crawler.contact in {path} to an email or URL so site owners can reach you."
         )
@@ -109,4 +147,5 @@ def load_config(path: str | Path = "config.toml") -> Settings:
         timeout=float(c.get("timeout", 30.0)),
         max_attempts=int(c.get("max_attempts", 3)),
         sites=sites,
+        ingredients=_ingredients(data.get("ingredients", {}), path.parent),
     )

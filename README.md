@@ -30,6 +30,33 @@ uv run recipe-crawler probe www.some-site.com   # test whether a new site works 
 For a multi-day crawl, run it in `tmux`/`screen` (or with `caffeinate -i` on a Mac so it doesn't sleep).
 Stopping and restarting is safe: all state lives in SQLite.
 
+## Ingredient processing
+
+Every distinct ingredient line is turned into English name, amount and unit with Gemini, then mapped back to
+the recipes (`recipe_ingredients`: recipe_id = `recipes.id`, pos, line_id, name, amount, unit).
+
+```bash
+uv run recipe-crawler lines            # collect new distinct lines into ingredient_lines (keeps done ones)
+uv run recipe-crawler process --dry-run  # what would be sent, today's quota per key
+uv run recipe-crawler process          # send to-do lines (most common first) until today's quota is used up
+uv run recipe-crawler map              # incremental: new recipes and recipes with newly done lines
+uv run recipe-crawler map --full       # drop and rebuild (needed after changing UNIT_FIX or ingredient_names)
+uv run recipe-crawler stats            # also ingredient progress, requests today per key x model, next reset
+uv run recipe-crawler --log-file data.nosync/ingredients.log process   # log to a file for scheduled runs
+```
+
+- **Keys**: `gemini_keys.txt` (not in git), one API key per line, **one key per Google Cloud project**: keys of
+  the same project share the quota. Keys are identified by a fingerprint (first 8 hex chars of the sha256) in
+  the usage log and the output, never by line number. Settings in `[ingredients]` of `config.toml`.
+- **Quota**: 500 requests per day per project and model on the free tier, reset at midnight Pacific
+  (08:00 / 09:00 Swiss time). `process` counts every request in `data.nosync/gemini_usage.jsonl` (the API
+  does not say what is left) and exits once every key x model has used today's quota. 503 (overloaded) answers
+  count towards the 500 too. Many keys of one account starting at once get 429 within minutes, so lanes start
+  `stagger` seconds apart; a short-term 429 pauses a lane for 2, 4, 8 … 30 min, a per-day 429 ends it for today.
+- **Stopping**: Ctrl+C / SIGTERM stops sending, waits for the requests in flight and saves them; a second
+  Ctrl+C aborts. Every answer is saved right away, so restarting is always safe.
+- `names` is a stub for the next step (merging names like "cilantro" / "coriander" via `ingredient_names`).
+
 ## How it works
 
 1. **robots.txt**: fetched per site and obeyed (including `Crawl-delay`). Sites that return 401/403 for

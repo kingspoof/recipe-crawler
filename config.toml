@@ -14,6 +14,21 @@ target_total = 1000000
 timeout = 30
 max_attempts = 3
 
+[ingredients]
+# Ingredient processing with Gemini (`lines` -> `process` -> `map`). Paths are relative to this file.
+models = ["gemini-3.5-flash-lite"]  # one lane per key x model; add "gemini-3.1-flash-lite" for more quota
+thinking_level = "minimal"
+batch_size = 650           # lines per request: ~18.5K output tokens, well below max_output_tokens
+max_output_tokens = 32768
+max_line_chars = 200       # longer lines are almost always prose, not ingredients: skipped
+max_attempts = 2           # a line the model leaves out this often is marked failed (status -1)
+rpd = 500                  # requests per day per key x model (free tier, check AI Studio); 0 = no own limit
+rpm = 14                   # our own pace per lane (the free tier allows 15)
+in_flight = 200            # requests at the same time per lane (~1 min per request)
+stagger = 5                # seconds between the first request of each lane
+usage_log = "data.nosync/gemini_usage.jsonl"
+keys_file = "gemini_keys.txt"  # one key per line, ONE KEY PER PROJECT (keys of a project share the quota)
+
 # ---------------------------------------------------------------------------------------------
 # Seed sites. Every site below was tested with `recipe-crawler probe` on 2026-10-28 and returned
 # schema.org recipes. `country` = cuisine the site mainly covers (ISO code), `region` = for balancing.
