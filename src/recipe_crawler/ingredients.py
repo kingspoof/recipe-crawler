@@ -218,9 +218,6 @@ def map_ingredients(conn: sqlite3.Connection, cfg: IngredientSettings, full: boo
     canonical = dict(conn.execute("SELECT name, canonical FROM ingredient_names"))
     stats = Counter({"recipes": 0, "rebuilt": 0, "rows": 0, "complete": 0})
 
-    # Failed lines (status -1) will not be done any more: they must not keep a recipe pending forever.
-    failed = {line for (line,) in conn.execute("SELECT line FROM ingredient_lines WHERE status = -1")}
-
     def rows_for(recipe_id: int, lines: list[str], done: dict[str, tuple[int, list, float]]) -> tuple[list, int]:
         rows, pending = [], 0
         for pos, line in enumerate(lines):
@@ -229,7 +226,7 @@ def map_ingredients(conn: sqlite3.Connection, cfg: IngredientSettings, full: boo
                 for entry in entries:
                     if isinstance(entry, list) and len(entry) == 3 and (c := clean(*entry)):
                         rows.append((recipe_id, pos, line_id, canonical.get(c[0], c[0]), c[1], c[2]))
-            elif line and len(line) <= cfg.max_line_chars and line not in failed:
+            elif line and len(line) <= cfg.max_line_chars:  # to do, or failed (can be reset to 0 by hand)
                 pending += 1
         return rows, pending
 
@@ -288,12 +285,9 @@ def _map_chunk(conn, chunk, rows_for, started, stats, insert, insert_state) -> N
     for recipe_id, lines in recipes.items():
         stats["recipes"] += 1
         since = mapped_at[recipe_id]
-        rows, pending = rows_for(recipe_id, lines, done)
         if since is not None and not any(line in done and done[line][2] > since for line in lines):
-            if pending == 0:  # nothing new, but its last pending lines failed: no need to check it again
-                conn.execute("UPDATE recipe_ingredients_state SET pending = 0 WHERE recipe_id = ?", (recipe_id,))
-                stats["complete"] += 1
             continue  # nothing new for this recipe
+        rows, pending = rows_for(recipe_id, lines, done)
         conn.execute("DELETE FROM recipe_ingredients WHERE recipe_id = ?", (recipe_id,))
         conn.executemany(insert, rows)
         conn.execute(insert_state, (recipe_id, started, pending))
@@ -339,14 +333,16 @@ def progress(conn: sqlite3.Connection) -> list[str]:
 
 
 def quota_report(cfg: IngredientSettings, keys: list[str]) -> list[str]:
-    used = UsageLog(cfg.usage_log).used_today(keys)
+    usage = UsageLog(cfg.usage_log)
+    used = usage.used_today(keys)
     reset = next_reset()
     left = reset - reset.now(reset.tzinfo)
     out = [f"quota day {quota_day()} (America/Los_Angeles), next reset {reset:%a %H:%M} local, "
            f"in {left.seconds // 3600}h {left.seconds % 3600 // 60:02}m"]
     lanes = {(fingerprint(k), m) for k in keys for m in cfg.models} | set(used)
     for key, model in sorted(lanes, key=str):
-        out.append(f"  {key}/{model}: {used.get((key, model), 0)}/{cfg.rpd or '-'} requests today")
+        out.append(f"  {key}/{model}: {used.get((key, model), 0)}/{cfg.rpd or '-'} requests today"
+                   + (" (429 per day: used up)" if (key, model) in usage.exhausted else ""))
     if not keys:
         out.append(f"  (no keys file at {cfg.keys_file}: old records are shown by line index)")
     return out
