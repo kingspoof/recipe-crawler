@@ -10,7 +10,8 @@ parser per site, and adding a new site is usually one line of config.
 
 ```bash
 uv sync
-# then edit config.toml and set crawler.contact to your (university) email
+# for crawl / discover / probe: set crawler.contact in config.toml to your (university) email
+# for the ingredient commands: put your Gemini keys in gemini_keys.txt (see below)
 ```
 
 > **Note:** this folder is on the iCloud-synced Desktop. The virtualenv (`.venv.nosync`) and the database
@@ -34,6 +35,7 @@ Stopping and restarting is safe: all state lives in SQLite.
 
 Every distinct ingredient line is turned into English name, amount and unit with Gemini, then mapped back to
 the recipes (`recipe_ingredients`: recipe_id = `recipes.id`, pos, line_id, name, amount, unit).
+This replaces `ingredient_processing.ipynb` (kept for reference only, don't run it next to the CLI).
 
 ```bash
 uv run recipe-crawler lines            # collect new distinct lines into ingredient_lines (keeps done ones)
@@ -52,7 +54,8 @@ uv run recipe-crawler --log-file data.nosync/ingredients.log process   # log to 
   (08:00 / 09:00 Swiss time). `process` counts every request in `data.nosync/gemini_usage.jsonl` (the API
   does not say what is left) and exits once every key x model has used today's quota. 503 (overloaded) answers
   count towards the 500 too. Many keys of one account starting at once get 429 within minutes, so lanes start
-  `stagger` seconds apart; a short-term 429 pauses a lane for 2, 4, 8 … 30 min, a per-day 429 ends it for today.
+  `stagger` seconds apart; a short-term 429 pauses a lane for 2, 4, 8 … 30 min, a per-day 429 ends it for today
+  (also for later runs that day: it is remembered in the usage log).
 - **Stopping**: Ctrl+C / SIGTERM stops sending, waits for the requests in flight and saves them; a second
   Ctrl+C aborts. Every answer is saved right away, so restarting is always safe.
 - `names` is a stub for the next step (merging names like "cilantro" / "coriander" via `ingredient_names`).
