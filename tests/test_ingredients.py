@@ -362,3 +362,35 @@ def test_cli_dry_run_and_stats(tmp_path, capsys):
     main(["-c", str(path), "stats"])
     out = capsys.readouterr().out
     assert "to do" in out and "next reset" in out
+
+
+# --------------------------------------------------------------------------- review fixes
+
+
+def test_config_error_disables_lane_without_failing_lines(db, cfg):
+    add_lines(db.conn, "a", "b", "c")
+    bad = FakeClient(lambda n, lines: (_ for _ in ()).throw(ApiError(400, "API key not valid", None)))
+    good = FakeClient()
+    p, reason = run(db, cfg, [bad, good], keys=("bad", "good"))
+    assert reason == "done" and p.lanes[0].exhausted and len(bad.calls) == 1
+    assert set(statuses(db.conn).values()) == {1}  # the bad key's batch went to the good key, nothing failed
+
+
+def test_original_needs_to_beat_lowercase_only(db, cfg):
+    add_recipe(db.conn, ["Salt"] * 4 + ["SALT"] * 3 + ["salt"] * 2)
+    ingredients.collect_lines(db.conn, cfg)
+    assert db.conn.execute("SELECT original FROM ingredient_lines WHERE line = 'salt'").fetchone()[0] == "Salt"
+
+
+def test_failed_line_does_not_keep_recipe_pending(db, cfg):
+    ingredients.ensure_schema(db.conn)
+    r1 = add_recipe(db.conn, ["1 egg", "pan de chancaca"])
+    done(db.conn, "1 egg", [["egg", 1, None]], 1)
+    db.conn.execute("INSERT INTO ingredient_lines (line, n, status) VALUES ('pan de chancaca', 1, 0)")
+    ingredients.map_ingredients(db.conn, cfg)
+    assert db.conn.execute("SELECT pending FROM recipe_ingredients_state").fetchone()[0] == 1
+    db.conn.execute("UPDATE ingredient_lines SET status = -1 WHERE line = 'pan de chancaca'")
+    stats = ingredients.map_ingredients(db.conn, cfg)  # nothing new, but the pending line failed
+    assert stats["rebuilt"] == 0 and stats["complete"] == 1
+    assert dict(db.conn.execute("SELECT recipe_id, pending FROM recipe_ingredients_state")) == {r1: 0}
+    assert ingredients.map_ingredients(db.conn, cfg)["recipes"] == 0  # not checked again

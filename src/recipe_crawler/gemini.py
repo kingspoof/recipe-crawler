@@ -384,8 +384,9 @@ class Processor:
                     if reason:
                         break
                 # Until the next lane may send again (rate limit or 429 pause), but at most 30 s.
-                wake = min((max(lane.next_at, lane.paused_until) for lane in self.lanes if not lane.exhausted),
-                           default=now + 30) - now
+                # Lanes at the in-flight limit wake up through a finished request, not through the clock.
+                wake = min((max(lane.next_at, lane.paused_until) for lane in self.lanes
+                            if not lane.exhausted and lane.in_flight < cfg.in_flight), default=now + 30) - now
                 if not futures:  # nothing in flight: every lane is waiting
                     if wake > 60:
                         log.info("all lanes paused, sleeping %.0f min", wake / 60)
@@ -408,6 +409,13 @@ class Processor:
             lane.got_429(self.clock(), rec.get("details", ""))
         elif not error:
             lane.n_429 = 0
+        if result is None and re.match(r"4\d\d ", error) and not error.startswith("429"):
+            # bad key (400/403), unknown model (404), ...: not the lines' fault, and retrying will not help
+            retry.extendleft(reversed(batch))
+            if not lane.exhausted:
+                log.error("%s: %s, lane disabled for this run", lane.name, error[:200])
+            lane.exhausted = True
+            return
         if result is None and transient(rec):
             retry.extendleft(reversed(batch))  # not the lines' fault: same attempt count
             quota_ids = sorted(set(re.findall(r'"quotaId": "([^"]+)"', rec.get("details", ""))))

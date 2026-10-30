@@ -247,6 +247,9 @@ def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
     used = usage.used_today(keys)
     db = DB(settings.db_path)
     if args.dry_run:  # no migrations, no requests, no usage records
+        if not db.conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'ingredient_lines'").fetchone():
+            db.close()
+            raise SystemExit("No ingredient_lines table yet: run `recipe-crawler lines` first.")
         todo = ingredients.todo_lines(db.conn)
         db.close()
         print(f"{len(todo):,} lines to do = {-(-len(todo) // cfg.batch_size):,} requests of {cfg.batch_size}")

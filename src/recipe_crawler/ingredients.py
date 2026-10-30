@@ -126,16 +126,18 @@ def collect_lines(conn: sqlite3.Connection, cfg: IngredientSettings) -> None:
                     spellings[line] += 1
     # Most common spelling per key; the lowercase key itself counts as a spelling too (-> original NULL).
     best: dict[str, tuple[int, str]] = {}
+    other: Counter[str] = Counter()  # per key: how often it is written in some non-lowercase spelling
     for line, n in spellings.items():
         key = line.lower()
+        other[key] += n
         if n > best.get(key, (0, ""))[0]:
             best[key] = (n, line)
     del spellings
     rows = []
     for key, n in counts.items():
         b = best.get(key)
-        rows.append((key, n, b[1] if b and b[0] > n - b[0] else None))
-    del counts, best
+        rows.append((key, n, b[1] if b and b[0] > n - other[key] else None))  # beats the lowercase spelling
+    del counts, best, other
     with _tx(conn):
         conn.executemany(
             """INSERT INTO ingredient_lines (line, n, original) VALUES (?, ?, ?)
@@ -216,6 +218,9 @@ def map_ingredients(conn: sqlite3.Connection, cfg: IngredientSettings, full: boo
     canonical = dict(conn.execute("SELECT name, canonical FROM ingredient_names"))
     stats = Counter({"recipes": 0, "rebuilt": 0, "rows": 0, "complete": 0})
 
+    # Failed lines (status -1) will not be done any more: they must not keep a recipe pending forever.
+    failed = {line for (line,) in conn.execute("SELECT line FROM ingredient_lines WHERE status = -1")}
+
     def rows_for(recipe_id: int, lines: list[str], done: dict[str, tuple[int, list, float]]) -> tuple[list, int]:
         rows, pending = [], 0
         for pos, line in enumerate(lines):
@@ -224,7 +229,7 @@ def map_ingredients(conn: sqlite3.Connection, cfg: IngredientSettings, full: boo
                 for entry in entries:
                     if isinstance(entry, list) and len(entry) == 3 and (c := clean(*entry)):
                         rows.append((recipe_id, pos, line_id, canonical.get(c[0], c[0]), c[1], c[2]))
-            elif line and len(line) <= cfg.max_line_chars:
+            elif line and len(line) <= cfg.max_line_chars and line not in failed:
                 pending += 1
         return rows, pending
 
@@ -283,9 +288,12 @@ def _map_chunk(conn, chunk, rows_for, started, stats, insert, insert_state) -> N
     for recipe_id, lines in recipes.items():
         stats["recipes"] += 1
         since = mapped_at[recipe_id]
-        if since is not None and not any(line in done and done[line][2] > since for line in lines):
-            continue  # nothing new for this recipe
         rows, pending = rows_for(recipe_id, lines, done)
+        if since is not None and not any(line in done and done[line][2] > since for line in lines):
+            if pending == 0:  # nothing new, but its last pending lines failed: no need to check it again
+                conn.execute("UPDATE recipe_ingredients_state SET pending = 0 WHERE recipe_id = ?", (recipe_id,))
+                stats["complete"] += 1
+            continue  # nothing new for this recipe
         conn.execute("DELETE FROM recipe_ingredients WHERE recipe_id = ?", (recipe_id,))
         conn.executemany(insert, rows)
         conn.execute(insert_state, (recipe_id, started, pending))
