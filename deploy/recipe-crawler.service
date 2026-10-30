@@ -1,0 +1,24 @@
+# systemd *user* service for running the crawler for days on a Raspberry Pi (or any Linux box).
+# Install:  mkdir -p ~/.config/systemd/user && cp deploy/recipe-crawler.service ~/.config/systemd/user/
+#           systemctl --user daemon-reload && systemctl --user enable --now recipe-crawler
+#           sudo loginctl enable-linger $USER    # keep running after logout / start at boot
+# Logs:     journalctl --user -u recipe-crawler -f
+
+[Unit]
+Description=Recipe crawler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/recipe-crawler
+ExecStart=%h/.local/bin/uv run --frozen recipe-crawler crawl
+# The crawler stops gracefully on SIGTERM (finishes in-flight requests).
+KillSignal=SIGTERM
+TimeoutStopSec=90
+# Restart after crashes or network outages, but not after a clean finish.
+Restart=on-failure
+RestartSec=60
+Nice=5
+
+[Install]
+WantedBy=default.target

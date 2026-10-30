@@ -1,0 +1,10 @@
+.venv
+.venv.nosync/
+data.nosync/
+__pycache__/
+*.db
+*.db-*
+*.jsonl
+.pytest_cache/
+gemini_keys.txt
+.DS_Store

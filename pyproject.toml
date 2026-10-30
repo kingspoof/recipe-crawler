@@ -1,0 +1,29 @@
+[project]
+name = "recipe-crawler"
+version = "0.1.0"
+description = "Polite crawler that collects schema.org recipes from sites around the world"
+readme = "README.md"
+authors = [
+    { name = "kingspoof", email = "lucien.kaeser@me.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=2.33.0",
+    "httpx>=0.28.1",
+    "langdetect>=1.0.9",
+    "lxml>=6.1.3",
+    "numpy>=2.5.4",
+    "protego>=0.7.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[project.scripts]
+recipe-crawler = "recipe_crawler.cli:main"
