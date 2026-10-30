@@ -268,6 +268,8 @@ def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
     ingredients.ensure_schema(db.conn)
     lanes = [gemini.Lane(k, gemini.GeminiClient(k), m, used[gemini.fingerprint(k), m], cfg.rpd)
              for m in cfg.models for k in keys]
+    for lane in lanes:
+        lane.exhausted = (lane.key, lane.model) in usage.exhausted
     processor = gemini.Processor(cfg, lanes, usage, ingredients.make_save(db.conn), max_requests=args.max_requests)
 
     def stop(*_: object) -> None:

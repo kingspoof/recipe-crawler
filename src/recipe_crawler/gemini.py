@@ -166,6 +166,7 @@ class UsageLog:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._lock = threading.Lock()
+        self.exhausted: set[tuple[str, str]] = set()  # filled by used_today()
 
     def write(self, rec: dict) -> None:
         with self._lock:
@@ -177,11 +178,13 @@ class UsageLog:
         """Requests per (key fingerprint, model) today. Every attempt counts, also 503s (AI Studio, 2026-10-29).
 
         Old records have "key": line index in the keys file; they are counted for the key at that index now.
-        Indexes beyond the file stay "#<index>".
+        Indexes beyond the file stay "#<index>". Also sets self.exhausted: the (key, model) pairs that got a
+        429 PerDay today, so a new run does not spend a request to find out again.
         """
         day = day or quota_day()
         fps = [fingerprint(k) for k in keys]
         used: Counter[tuple[str, str]] = Counter()
+        exhausted: set[tuple[str, str]] = set()
         try:
             with open(self.path) as f:
                 for line in f:
@@ -195,8 +198,11 @@ class UsageLog:
                     if isinstance(key, int):
                         key = fps[key] if 0 <= key < len(fps) else f"#{key}"
                     used[key, rec.get("model")] += 1
+                    if "PerDay" in rec.get("details", ""):  # Google says the day is used up, whatever we counted
+                        exhausted.add((key, rec.get("model")))
         except FileNotFoundError:
             pass
+        self.exhausted = exhausted
         return used
 
 
