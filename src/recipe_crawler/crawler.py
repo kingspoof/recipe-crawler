@@ -84,10 +84,15 @@ class DomainWorker:
             urls_found += self.db.add_urls(self.site.domain, [u for u in starts if self.robots.allowed(u)])
         self.log.info("discovering URLs from %d sitemap root(s)", len(roots))
 
+        failed: list[str] = []
+
         async def fetch(url: str) -> Response | None:
             if not self.robots.allowed(url):
                 return None
-            return await self._get(url, MAX_SITEMAP_BYTES)
+            r = await self._get(url, MAX_SITEMAP_BYTES)
+            if r is None or r.status == 429 or r.status >= 500:  # temporary: try again next run
+                failed.append(url)
+            return r
 
         async for sm, urls in iter_sitemaps(self.site, roots, fetch):
             sitemaps_read += 1
@@ -98,6 +103,14 @@ class DomainWorker:
                 self.log.info("... %d sitemaps read, %d URLs queued", sitemaps_read, urls_found)
             if self.c.stopping:
                 return  # not marked as discovered, so it resumes next time
+        if self.c.stopping:
+            return
+        if failed:
+            # Not marked as discovered, so the next run reads the sitemaps again (the URLs already queued
+            # are ignored then). Marking it would hide the missing sitemaps until `discover --force`.
+            self.log.warning("discovery incomplete: %d sitemap(s) failed (e.g. %s), %d sitemaps read, %d URLs "
+                             "queued; retrying next run", len(failed), failed[0], sitemaps_read, urls_found)
+            return
         self.db.set_discovered(self.site.domain, sitemaps_read, urls_found)
         self.log.info("discovery done: %d sitemaps, %d URLs queued", sitemaps_read, urls_found)
 
@@ -194,7 +207,7 @@ class DomainWorker:
                 return
             if force_discover:
                 self.db.reset_discovery(self.site.domain)
-            if not self.db.is_discovered(self.site.domain):
+            if not self.db.is_discovered(self.site.domain, self.c.settings.rediscover_after_days):
                 await self.discover()
             if not discover_only:
                 await self.crawl()

@@ -13,6 +13,7 @@ max_recipes_per_region = 200000 # keeps one region (so far: Europe) from dominat
 target_total = 1000000
 timeout = 30
 max_attempts = 3
+rediscover_after_days = 30     # read the sitemaps again after this many days to find new recipes (0 = never)
 
 [ingredients]
 # Ingredient processing with Gemini (`lines` -> `process` -> `map`). Paths are relative to this file.

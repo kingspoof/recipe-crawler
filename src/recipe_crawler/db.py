@@ -142,9 +142,12 @@ class DB:
                 (status, http_status, error, time.time(), url),
             )
 
-    def is_discovered(self, domain: str) -> bool:
+    def is_discovered(self, domain: str, max_age_days: float = 0) -> bool:
+        """True if the sitemaps were read completely, and (max_age_days > 0) not longer ago than that."""
         row = self.conn.execute("SELECT discovered_at FROM domains WHERE domain = ?", (domain,)).fetchone()
-        return bool(row and row["discovered_at"])
+        if not (row and row["discovered_at"]):
+            return False
+        return max_age_days <= 0 or row["discovered_at"] > time.time() - max_age_days * 86400
 
     def set_discovered(self, domain: str, sitemaps_read: int, urls_found: int) -> None:
         self.conn.execute(

@@ -88,3 +88,42 @@ def test_invalid_url_is_a_network_error(tmp_path):
     db.add_urls("x.test", ["https://x.test/a b"])
     asyncio.run(w.run())
     assert status(db, "https://x.test/a b") == ("failed", 3)
+
+
+SITEMAP_INDEX = """<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<sitemap><loc>https://x.test/sm-1.xml</loc></sitemap><sitemap><loc>https://x.test/sm-2.xml</loc></sitemap>
+</sitemapindex>"""
+
+
+def urlset(*urls):
+    locs = "".join(f"<url><loc>{u}</loc></url>" for u in urls)
+    return f'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{locs}</urlset>'
+
+
+def test_discovery_with_a_failed_sitemap_is_not_marked_done(tmp_path):
+    """Regression: a child sitemap that got a 503 was skipped and the domain was still marked discovered."""
+    xml = {"content-type": "application/xml"}
+    routes = {"https://x.test/robots.txt": (200, ROBOTS_OK + "Sitemap: https://x.test/index.xml\n",
+                                            {"content-type": "text/plain"}),
+              "https://x.test/index.xml": (200, SITEMAP_INDEX, xml),
+              "https://x.test/sm-1.xml": (200, urlset("https://x.test/r/1"), xml),
+              "https://x.test/sm-2.xml": (503, "", xml)}
+    crawler, w, db = make(tmp_path, routes)
+    asyncio.run(w.run(discover_only=True))
+    assert not db.is_discovered("x.test")
+    assert db.conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0] == 1  # what was found is kept
+
+    routes["https://x.test/sm-2.xml"] = (200, urlset("https://x.test/r/2"), xml)
+    crawler, w, db = make(tmp_path, routes)
+    asyncio.run(w.run(discover_only=True))
+    assert db.is_discovered("x.test")
+    assert db.conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0] == 2
+
+
+def test_rediscover_after_days(tmp_path):
+    db = DB(tmp_path / "r.db")
+    db.set_discovered("x.test", 1, 1)
+    assert db.is_discovered("x.test", 30) and db.is_discovered("x.test", 0)
+    db.conn.execute("UPDATE domains SET discovered_at = discovered_at - 31 * 86400")
+    assert not db.is_discovered("x.test", 30)
+    assert db.is_discovered("x.test", 0)  # 0 = never again

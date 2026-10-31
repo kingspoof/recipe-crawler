@@ -67,6 +67,8 @@ class Settings:
     target_total: int = 1_000_000
     timeout: float = 30.0
     max_attempts: int = 3
+    # Read a site's sitemaps again after this many days to find new recipes (0 = never, only `discover --force`).
+    rediscover_after_days: float = 30
     sites: list[Site] = field(default_factory=list)
     ingredients: IngredientSettings = field(default_factory=IngredientSettings)
 
@@ -146,6 +148,7 @@ def load_config(path: str | Path = "config.toml", require_contact: bool = True) 
         target_total=int(c.get("target_total", 1_000_000)),
         timeout=float(c.get("timeout", 30.0)),
         max_attempts=int(c.get("max_attempts", 3)),
+        rediscover_after_days=float(c.get("rediscover_after_days", 30)),
         sites=sites,
         ingredients=_ingredients(data.get("ingredients", {}), path.parent),
     )
