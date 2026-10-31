@@ -517,3 +517,36 @@ def test_build_lanes_starts_per_day_429_lanes_exhausted(cfg):
     used = usage.used_today(["k1"])
     lanes = ingredients.build_lanes(cfg, ["k1"], usage, used, client=lambda k: FakeClient())
     assert [(lane.model, lane.used, lane.exhausted) for lane in lanes] == [("m1", 0, False), ("m2", 1, True)]
+
+
+def test_map_full_crash_keeps_the_old_table_and_writers_get_in_between(db, cfg, monkeypatch, tmp_path):
+    ingredients.ensure_schema(db.conn)
+    for i in range(5):
+        add_recipe(db.conn, ["1 egg"])
+    done(db.conn, "1 egg", [["egg", 1, None]], 1)
+    ingredients.map_ingredients(db.conn, cfg)
+    before = ri(db.conn)
+    monkeypatch.setattr(ingredients, "FULL_CHUNK", 2)
+
+    other = sqlite3.connect(tmp_path / "recipes.db", timeout=0, isolation_level=None)
+    calls = []
+    real_norm = ingredients.norm
+
+    def norm(x):
+        calls.append(x)
+        if len(calls) == 3:  # between chunk 1 and 2: another process writes (would fail if map held the lock)
+            other.execute("INSERT INTO domains(domain) VALUES ('written during map --full')")
+        if len(calls) == 5:
+            raise MemoryError("crash in the middle")
+        return real_norm(x)
+
+    monkeypatch.setattr(ingredients, "norm", norm)
+    with pytest.raises(MemoryError):
+        ingredients.map_ingredients(db.conn, cfg, full=True)
+    assert not db.conn.in_transaction and ri(db.conn) == before  # old table untouched
+    assert other.execute("SELECT COUNT(*) FROM domains").fetchone()[0] == 1
+    other.close()
+    monkeypatch.setattr(ingredients, "norm", real_norm)
+    ingredients.map_ingredients(db.conn, cfg, full=True)  # the leftover _new tables are replaced
+    assert ri(db.conn) == before
+    assert not schema.has_table(db.conn, "recipe_ingredients_new")

@@ -35,10 +35,7 @@ from .gemini import (PROMPT, Client, GeminiClient, Lane, Line, UsageLog, fingerp
 
 log = logging.getLogger("ingredients")
 
-RECIPE_INGREDIENTS_INDEXES = """
-CREATE INDEX IF NOT EXISTS recipe_ingredients_recipe ON recipe_ingredients(recipe_id);
-CREATE INDEX IF NOT EXISTS recipe_ingredients_name ON recipe_ingredients(name);
-"""
+FULL_CHUNK = 5000  # recipes per transaction in `map --full`: the write lock is held for a moment at a time
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -227,40 +224,59 @@ def map_ingredients(conn: sqlite3.Connection, cfg: IngredientSettings, full: boo
 
     insert = "INSERT INTO recipe_ingredients VALUES (?, ?, ?, ?, ?, ?)"
     insert_state = "INSERT OR REPLACE INTO recipe_ingredients_state VALUES (?, ?, ?)"
-    with _tx(conn):
-        if full:
-            done = {line: (id, json.loads(items), done_at or 0) for id, line, items, done_at in conn.execute(
-                "SELECT id, line, items, done_at FROM ingredient_lines WHERE status = 1")}
-            conn.execute("DROP TABLE IF EXISTS recipe_ingredients")
-            conn.execute(RECIPE_INGREDIENTS)
-            conn.execute("DELETE FROM recipe_ingredients_state")
-            rows, states = [], []
-            for recipe_id, ingredients in conn.execute("SELECT id, ingredients FROM recipes"):
-                r, pending = rows_for(recipe_id, [norm(x) for x in json.loads(ingredients)], done)
-                rows += r
-                states.append((recipe_id, started, pending))
-                stats["recipes"] += 1
-                stats["complete"] += pending == 0
-                if len(rows) > 200_000:
-                    conn.executemany(insert, rows)
-                    stats["rows"] += len(rows)
-                    rows = []
-            conn.executemany(insert, rows)
-            conn.executemany(insert_state, states)
-            stats["rows"] += len(rows)
-            stats["rebuilt"] = stats["recipes"]
-            del done, states
-            for statement in RECIPE_INGREDIENTS_INDEXES.strip().split(";")[:-1]:  # no executescript: it commits
-                conn.execute(statement)
-        else:
-            candidates = conn.execute(
-                """SELECT r.id, s.mapped_at FROM recipes r LEFT JOIN recipe_ingredients_state s ON s.recipe_id = r.id
-                   WHERE s.recipe_id IS NULL OR s.pending > 0""").fetchall()
-            for i in range(0, len(candidates), 1000):
+    if full:
+        _map_full(conn, rows_for, started, stats)
+    else:
+        candidates = conn.execute(
+            """SELECT r.id, s.mapped_at FROM recipes r LEFT JOIN recipe_ingredients_state s ON s.recipe_id = r.id
+               WHERE s.recipe_id IS NULL OR s.pending > 0""").fetchall()
+        for i in range(0, len(candidates), 1000):
+            with _tx(conn):  # one transaction per chunk: `crawl` and `process` can write in between
                 _map_chunk(conn, candidates[i:i + 1000], rows_for, started, stats, insert, insert_state)
     log.info("%s rows for %s rebuilt recipes in %.0f s (%s recipes checked)", f"{stats['rows']:,}",
              f"{stats['rebuilt']:,}", time.time() - started, f"{stats['recipes']:,}")
     return dict(stats)
+
+
+def _map_full(conn, rows_for, started, stats) -> None:
+    """Builds recipe_ingredients_new (+ state) chunk by chunk, then swaps both in with one short transaction.
+    Until the swap, readers see the old table; a crash leaves the old table untouched."""
+    done = {line: (id, json.loads(items), done_at or 0) for id, line, items, done_at in conn.execute(
+        "SELECT id, line, items, done_at FROM ingredient_lines WHERE status = 1")}
+    suffix = time.time_ns()  # index names must be unique while the old table still exists
+    with _tx(conn):
+        conn.execute("DROP TABLE IF EXISTS recipe_ingredients_new")  # left over from a crashed run
+        conn.execute("DROP TABLE IF EXISTS recipe_ingredients_state_new")
+        conn.execute(RECIPE_INGREDIENTS.replace("IF NOT EXISTS recipe_ingredients", "recipe_ingredients_new"))
+        conn.execute("CREATE TABLE recipe_ingredients_state_new "
+                     "(recipe_id INTEGER PRIMARY KEY, mapped_at REAL NOT NULL, pending INTEGER NOT NULL)")
+        # Indexes first, so each chunk keeps them up to date (no minute-long CREATE INDEX holding the lock).
+        conn.execute(f"CREATE INDEX recipe_ingredients_recipe_{suffix} ON recipe_ingredients_new(recipe_id)")
+        conn.execute(f"CREATE INDEX recipe_ingredients_name_{suffix} ON recipe_ingredients_new(name)")
+    last = -1
+    while True:
+        chunk = conn.execute("SELECT id, ingredients FROM recipes WHERE id > ? ORDER BY id LIMIT ?",
+                             (last, FULL_CHUNK)).fetchall()
+        if not chunk:
+            break
+        last = chunk[-1][0]
+        rows, states = [], []
+        for recipe_id, ingredients in chunk:
+            r, pending = rows_for(recipe_id, [norm(x) for x in json.loads(ingredients)], done)
+            rows += r
+            states.append((recipe_id, started, pending))
+            stats["complete"] += pending == 0
+        with _tx(conn):
+            conn.executemany("INSERT INTO recipe_ingredients_new VALUES (?, ?, ?, ?, ?, ?)", rows)
+            conn.executemany("INSERT INTO recipe_ingredients_state_new VALUES (?, ?, ?)", states)
+        stats["recipes"] += len(chunk)
+        stats["rows"] += len(rows)
+    stats["rebuilt"] = stats["recipes"]
+    with _tx(conn):
+        conn.execute("DROP TABLE recipe_ingredients")
+        conn.execute("DROP TABLE recipe_ingredients_state")
+        conn.execute("ALTER TABLE recipe_ingredients_new RENAME TO recipe_ingredients")
+        conn.execute("ALTER TABLE recipe_ingredients_state_new RENAME TO recipe_ingredients_state")
 
 
 def _map_chunk(conn, chunk, rows_for, started, stats, insert, insert_state) -> None:

@@ -23,6 +23,7 @@ _JSON_FIELDS = ("ingredients", "instructions", "cuisine", "category", "keywords"
 # Seconds a connection waits for another one's write lock. `map` and `crawl` run at the same time, and a
 # `map` chunk or a big `add_urls` can hold the lock for a few seconds.
 BUSY_TIMEOUT = 60.0
+JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024
 
 
 @contextmanager
@@ -77,6 +78,9 @@ class DB:
             return
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        # After a checkpoint, the -wal file is truncated to this size instead of keeping its peak size
+        # (`map --full` used to leave GBs behind).
+        self.conn.execute(f"PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT}")
         schema.migrate(self.conn, backup)
 
     def close(self) -> None:
