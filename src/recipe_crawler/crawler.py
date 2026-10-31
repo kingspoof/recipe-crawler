@@ -46,7 +46,7 @@ class DomainWorker:
         await self.throttle.wait()
         try:
             r = await self.c.fetcher.get(url, max_bytes) if max_bytes else await self.c.fetcher.get(url)
-        except (httpx.HTTPError, TooLarge) as e:
+        except (httpx.HTTPError, httpx.InvalidURL, TooLarge) as e:  # InvalidURL is not an HTTPError
             self.throttle.done()
             self.consecutive_failures += 1
             self.log.debug("GET %s failed: %s", url, e)
@@ -131,7 +131,12 @@ class DomainWorker:
                         "only %d recipes in %d pages; set url_pattern/sitemap_pattern for this site "
                         "(see `probe`). Pausing domain.", self.recipes, self.pages)
                     return
-                await self._process(url)
+                try:
+                    await self._process(url)
+                except Exception as e:  # a page that crashes the parser must not stall the domain on every run
+                    self.log.warning("%s crashed the worker: %s: %s", url, type(e).__name__, e)
+                    self.db.mark(url, "error", error=f"crash {type(e).__name__}: {e}"[:300],
+                                 max_attempts=s.max_attempts)
 
     async def _process(self, url: str) -> None:
         s = self.c.settings
