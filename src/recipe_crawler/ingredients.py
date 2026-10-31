@@ -23,10 +23,8 @@ import logging
 import sqlite3
 import time
 from collections import Counter
-from contextlib import contextmanager
-from typing import Iterator
-
 from .config import IngredientSettings
+from .db import transaction as _tx
 from .gemini import Line, UsageLog, fingerprint, next_reset, quota_day
 
 log = logging.getLogger("ingredients")
@@ -85,18 +83,6 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def _has_table(conn: sqlite3.Connection, table: str) -> bool:
     return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
-
-
-@contextmanager
-def _tx(conn: sqlite3.Connection) -> Iterator[None]:
-    """One transaction (DB opens the connection in autocommit mode)."""
-    conn.execute("BEGIN")
-    try:
-        yield
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    conn.execute("COMMIT")
 
 
 def _spelling(line: object) -> str:

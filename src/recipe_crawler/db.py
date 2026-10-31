@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -66,12 +67,37 @@ CREATE INDEX IF NOT EXISTS recipes_domain ON recipes(domain);
 
 _JSON_FIELDS = ("ingredients", "instructions", "cuisine", "category", "keywords", "nutrition")
 
+# Seconds a connection waits for another one's write lock. `map` and `crawl` run at the same time, and a
+# `map` chunk or a big `add_urls` can hold the lock for a few seconds.
+BUSY_TIMEOUT = 60.0
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection, immediate: bool = True) -> Iterator[None]:
+    """One transaction on an autocommit connection; rolled back on any error, so the connection never stays
+    inside a half-done transaction (which would silently swallow every later write until it is closed).
+
+    immediate: take the write lock right away (BEGIN IMMEDIATE). A deferred BEGIN that reads first and writes
+    later fails with SQLITE_BUSY at the first write if another connection committed in between, and the busy
+    timeout does not help there.
+    """
+    if conn.in_transaction:
+        raise RuntimeError("transaction() does not nest: a transaction is already open")
+    conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+    try:
+        yield
+    except BaseException:
+        if conn.in_transaction:  # some errors (e.g. SQLITE_FULL) already rolled back
+            conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
 
 class DB:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, timeout: float = BUSY_TIMEOUT):
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=timeout)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
@@ -85,12 +111,11 @@ class DB:
     def add_urls(self, domain: str, urls: Iterable[str]) -> int:
         now = time.time()
         before = self.conn.total_changes
-        self.conn.execute("BEGIN")
-        self.conn.executemany(
-            "INSERT OR IGNORE INTO urls(url, domain, updated_at) VALUES (?, ?, ?)",
-            ((u, domain, now) for u in urls),
-        )
-        self.conn.execute("COMMIT")
+        with transaction(self.conn):
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO urls(url, domain, updated_at) VALUES (?, ?, ?)",
+                ((u, domain, now) for u in urls),
+            )
         return self.conn.total_changes - before
 
     def next_batch(self, domain: str, limit: int, max_attempts: int) -> list[str]:
