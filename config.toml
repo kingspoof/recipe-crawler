@@ -30,6 +30,15 @@ stagger = 5                # seconds between the first request of each lane
 usage_log = "data.nosync/gemini_usage.jsonl"
 keys_file = "gemini_keys.txt"  # one key per line, ONE KEY PER PROJECT (keys of a project share the quota)
 
+[backup]
+# REQUIRED for `recipe-crawler backup`: a folder OUTSIDE iCloud Drive / Dropbox, ideally on another disk,
+# e.g. "/Volumes/Backup/recipe-crawler". Relative paths are relative to this file.
+dir = ""
+daily_keep = 14       # daily backups of the irreplaceable tables (ingredient_lines, ingredient_names, domains)
+full_keep = 2         # newest full backups, always kept
+weekly_keep = 4       # plus the newest full backup of each of the last 4 weeks
+full_every_days = 7   # `backup` takes a full backup when the newest one is older than this
+
 # ---------------------------------------------------------------------------------------------
 # Seed sites. Every site below was tested with `recipe-crawler probe` on 2026-10-28 and returned
 # schema.org recipes. `country` = cuisine the site mainly covers (ISO code), `region` = for balancing.

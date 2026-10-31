@@ -23,11 +23,18 @@ import sys
 from collections import Counter
 from urllib.parse import urlsplit
 
-from . import gemini, ingredients
+from . import backup, gemini, ingredients
 from .config import Settings, Site, load_config
 from .crawler import Crawler
 from .db import DB
 from .probe import probe_site
+
+
+def open_db(settings: Settings) -> DB:
+    """For write commands: migrates the schema if needed, with a full backup first when a migration asks for
+    one (refused if [backup] dir is not set)."""
+    take = (lambda: backup.full(settings.db_path, settings.backup)) if settings.backup.dir else None
+    return DB(settings.db_path, backup=take)
 
 
 def _selected_sites(settings: Settings, domains: list[str] | None) -> list[Site]:
@@ -42,7 +49,7 @@ def _selected_sites(settings: Settings, domains: list[str] | None) -> list[Site]
 def cmd_crawl(settings: Settings, args: argparse.Namespace, discover_only: bool = False) -> None:
     if args.target:
         settings.target_total = args.target
-    db = DB(settings.db_path)
+    db = open_db(settings)
     crawler = Crawler(settings, db)
     sites = _selected_sites(settings, args.domain)
 
@@ -148,7 +155,7 @@ def cmd_export(settings: Settings, args: argparse.Namespace) -> None:
 
 
 def cmd_lines(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path)
+    db = open_db(settings)
     ingredients.collect_lines(db.conn, settings.ingredients)
     db.close()
 
@@ -173,7 +180,7 @@ def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
         finally:
             db.close()
         return
-    db = DB(settings.db_path)
+    db = open_db(settings)
     ingredients.apply_spool(db.conn, cfg)
     lanes = ingredients.build_lanes(cfg, keys, usage, used)
     processor = gemini.Processor(cfg, lanes, usage, ingredients.make_save(db.conn), max_requests=args.max_requests,
@@ -195,7 +202,7 @@ def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
 
 
 def cmd_map(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path)
+    db = open_db(settings)
     ingredients.map_ingredients(db.conn, settings.ingredients, full=args.full)
     db.close()
 
@@ -204,6 +211,23 @@ def cmd_names(settings: Settings, args: argparse.Namespace) -> None:
     db = DB(settings.db_path, readonly=True)
     print("\n".join(ingredients.names_report(db.conn)))
     db.close()
+
+
+# --------------------------------------------------------------------------- backup / check
+
+
+def cmd_backup(settings: Settings, args: argparse.Namespace) -> None:
+    DB(settings.db_path, readonly=True).close()  # refuses a missing DB
+    for path in backup.run(settings.db_path, settings.backup, force_full=args.full):
+        print(f"wrote {path}")
+    print(backup.checkpoint(settings.db_path))
+
+
+def cmd_check(settings: Settings, args: argparse.Namespace) -> None:
+    ok, lines = backup.check(settings.backup)
+    print("\n".join(lines))
+    if not ok:
+        raise SystemExit(1)
 
 
 # --------------------------------------------------------------------------- main
@@ -253,6 +277,10 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("names", help="(next step, stub) standardize ingredient names via ingredient_names")
 
+    sp = sub.add_parser("backup", help="daily backup of the irreplaceable tables, a full one when due")
+    sp.add_argument("--full", action="store_true", help="also take a full backup now")
+    sub.add_parser("check", help="quick_check the newest backups and check that they are recent")
+
     args = p.parse_args(argv)
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if args.log_file:
@@ -289,3 +317,7 @@ def main(argv: list[str] | None = None) -> None:
         cmd_map(settings, args)
     elif args.cmd == "names":
         cmd_names(settings, args)
+    elif args.cmd == "backup":
+        cmd_backup(settings, args)
+    elif args.cmd == "check":
+        cmd_check(settings, args)

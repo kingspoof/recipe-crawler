@@ -56,6 +56,20 @@ class IngredientSettings:
 
 
 @dataclass
+class BackupSettings:
+    """[backup] in config.toml. dir is required for `backup` (no default, so nothing lands in a synced folder)."""
+
+    # Cannot be rebuilt cheaply: the Gemini answers (quota), canonical names, discovery state.
+    DAILY_TABLES = ("ingredient_lines", "ingredient_names", "domains")
+
+    dir: Path | None = None
+    daily_keep: int = 14
+    full_keep: int = 2  # the newest full backups, always kept
+    weekly_keep: int = 4  # plus the newest full backup of each of the last N calendar weeks
+    full_every_days: float = 7
+
+
+@dataclass
 class Settings:
     user_agent: str
     db_path: Path
@@ -71,6 +85,7 @@ class Settings:
     rediscover_after_days: float = 30
     sites: list[Site] = field(default_factory=list)
     ingredients: IngredientSettings = field(default_factory=IngredientSettings)
+    backup: BackupSettings = field(default_factory=BackupSettings)
 
     def site(self, domain: str) -> Site:
         for s in self.sites:
@@ -98,6 +113,18 @@ def _ingredients(data: dict, base: Path) -> IngredientSettings:
         stagger=float(data.get("stagger", d.stagger)),
         usage_log=base / data.get("usage_log", d.usage_log),
         keys_file=base / data.get("keys_file", d.keys_file),
+    )
+
+
+def _backup(data: dict, base: Path) -> BackupSettings:
+    d = BackupSettings()
+    raw = str(data.get("dir", "")).strip()
+    return BackupSettings(
+        dir=base / Path(raw).expanduser() if raw else None,  # an absolute dir stays as it is
+        daily_keep=int(data.get("daily_keep", d.daily_keep)),
+        full_keep=int(data.get("full_keep", d.full_keep)),
+        weekly_keep=int(data.get("weekly_keep", d.weekly_keep)),
+        full_every_days=float(data.get("full_every_days", d.full_every_days)),
     )
 
 
@@ -151,4 +178,5 @@ def load_config(path: str | Path = "config.toml", require_contact: bool = True) 
         rediscover_after_days=float(c.get("rediscover_after_days", 30)),
         sites=sites,
         ingredients=_ingredients(data.get("ingredients", {}), path.parent),
+        backup=_backup(data.get("backup", {}), path.parent),
     )
