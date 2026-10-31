@@ -62,8 +62,11 @@ CREATE TABLE IF NOT EXISTS recipes (
     crawled_at     REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS recipes_domain ON recipes(domain);
+"""
 
--- Site discovery (`scout`). Additive: new tables only, nothing existing changes.
+# Site discovery (`scout`). Additive: new tables only, nothing existing changes.
+# Kept separate so it can become one entry of a migration list.
+SCOUT_SCHEMA = """
 -- External hosts linked from crawled pages, counted once per page (written in batches during `crawl`).
 CREATE TABLE IF NOT EXISTS candidate_links (
     host        TEXT NOT NULL,     -- as seen in the link, lowercase
@@ -106,6 +109,7 @@ class DB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        self.conn.executescript(SCOUT_SCHEMA)
 
     def close(self) -> None:
         self.conn.close()
