@@ -307,6 +307,8 @@ class Lane:
         self.paused_until = 0.0  # after a 429
         self.n_429 = 0
         self.n_transient = 0  # network / unexplained 5xx failures in a row
+        self.ok = 0  # requests of this lane that got an answer
+        self.ok_at_failure = -1  # self.ok at the last 5xx / network failure
         self.exhausted = False  # today's quota is used up (by our count or by a 429 PerDay)
 
     def check_quota(self) -> None:
@@ -351,7 +353,7 @@ class Line:
     text: str  # what is sent: the original spelling if there is one, else the lowercase key
     attempts: int = 0  # times the model left it out so far
     server_errors: int = 0  # 5xx blamed on this line alone (batch of one, others succeeded in between)
-    failed_mark: int | None = None  # Processor.successes when its batch last failed with a 5xx
+    failed_mark: tuple[str, int] | None = None  # (model, Processor.successes[model]) at its last 5xx
     max_batch: int = 0  # after a split: at most this many lines per batch (0 = batch_size)
 
 
@@ -403,7 +405,9 @@ class Processor:
         self.sent = self.done = self.failed = 0
         self.tokens: Counter[str] = Counter()
         self.error: BaseException | None = None  # a bug in a worker thread: raised after the requests in flight
-        self.successes = 0  # requests that got an answer: evidence that a 5xx is the batch's fault
+        # requests that got an answer, per model: evidence that a 5xx is the batch's fault. Per model, because
+        # one model can be down while another works.
+        self.successes: Counter[str] = Counter()
         self.spooling = False  # the database failed: everything else goes straight to the spool
 
     def save(self, answered: list[tuple[int, list]], failed: list[int], model: str, gave_up: list[int] = ()) -> None:  # type: ignore[assignment]
@@ -529,16 +533,21 @@ class Processor:
 
     def _server_error(self, lane: Lane, batch: list[Line], error: str, retry: deque[Line], todo: deque[Line]) -> None:
         """Network error or 5xx: never counted as an attempt. See MAX_TRANSIENT."""
+        model, ok_now = lane.model, self.successes[lane.model]
         marks = [line.failed_mark for line in batch]
-        failed_before = None not in marks
-        others_ok = failed_before and self.successes > max(m for m in marks if m is not None)
-        # Nothing else left to send: no other batch can show whether the service works. Then a second failure
-        # is blamed on the batch anyway; if that is wrong (an outage at the very end), the worst case is a
-        # few lines at GAVE_UP, which can be reset.
-        alone = not retry and not todo
+        failed_before = all(m is not None and m[0] == model for m in marks)  # with this model
+        others_ok = failed_before and ok_now > max(m[1] for m in marks if m is not None)
+        # Nothing else left to send and no lane with another model: nothing can show whether the service
+        # works. Then a second failure is blamed on the batch anyway; if that is wrong (an outage at the very
+        # end), the worst case is a few lines at GAVE_UP, which can be reset.
+        alone = not retry and not todo and all(la.model == model for la in self.lanes if not la.exhausted)
         blamed = not error.startswith("network") and failed_before and (others_ok or alone)
+        lane_stuck = lane.ok == lane.ok_at_failure  # this lane got nothing through since its last failure
+        lane.ok_at_failure = lane.ok
         for line in batch:
-            line.failed_mark = self.successes
+            line.failed_mark = (model, ok_now)
+        if blamed and lane_stuck:
+            lane.got_transient(self.clock(), error)  # blamed or not, a lane that only fails slows down
         if not blamed:
             # No answer at all, or nothing else got through since this batch last failed: the network or the
             # service is the problem. Pause the lane; a 5xx batch goes to the back, so other batches show
@@ -576,7 +585,8 @@ class Processor:
             lane.got_429(self.clock(), rec.get("details", ""))
         elif result is not None:  # an answer (also bad or cut-off JSON): the service and the network work
             lane.n_429 = lane.n_transient = 0
-            self.successes += 1
+            lane.ok += 1
+            self.successes[lane.model] += 1
         if result is None and re.match(r"4\d\d ", error) and not error.startswith("429"):
             # bad key (400/403), unknown model (404), ...: not the lines' fault, and retrying will not help
             retry.extendleft(reversed(batch))

@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import time
+from collections import deque
 
 import pytest
 
@@ -629,3 +630,48 @@ def test_lines_commits_in_chunks(db, cfg, monkeypatch):
     db.conn.set_trace_callback(None)
     assert len(commits) == 3 + 1  # 6 lines in chunks of 2, then the status update
     assert len(statuses(db.conn)) == 6 and statuses(db.conn)["x" * 201] == -2
+
+
+def test_one_model_down_does_not_blame_its_batches(db, cfg):
+    """Review N1: with a global success counter, a model in a 5xx outage got its batches blamed (split, -3)
+    because another model kept succeeding."""
+    cfg.batch_size, cfg.rpm, cfg.rpd = 2, 60, 10_000  # ~1 request/s per lane: the bad lane retries while work is left
+    add_lines(db.conn, *[f"line {i}" for i in range(4000)])  # ~35 min of work: the bad lanes come back
+    down = FakeClient(lambda n, lines: (_ for _ in ()).throw(ApiError(500, "internal")))
+    up = FakeClient()
+    clock = FakeClock()
+    usage = UsageLog(cfg.usage_log)
+    # like the reviewer's simulation: three keys on the model that is down, one on the model that works
+    lanes = [Lane(k, down, "m-down", 0, cfg.rpd) for k in ("k1", "k2", "k3")] + [Lane("k1", up, "m-up", 0, cfg.rpd)]
+    p, reason = run(db, cfg, None, clock=clock, lanes=lanes)
+    assert reason == "done" and set(statuses(db.conn).values()) == {1} and p.failed == 0
+    assert max(len(c) for c in down.calls) == 2  # never split
+    # each bad lane pauses 2, 4, 8, 16 ... min: a handful of calls per lane, not one per batch (~2000)
+    assert len(down.calls) <= 3 * 6 * (1 + gemini.MAX_RETRIES)
+
+
+
+def test_blame_needs_successes_of_the_same_model(cfg):
+    """Review N1, pinned at the decision: successes of another model do not blame a batch, and a lane that
+    only fails is paused even when its batch is blamed."""
+    clock = FakeClock()
+    down = Lane("k1", FakeClient(), "m-down", 0, cfg.rpd)
+    down2 = Lane("k2", FakeClient(), "m-down", 0, cfg.rpd)
+    up = Lane("k1", FakeClient(), "m-up", 0, cfg.rpd)
+    p = Processor(cfg, [down, down2, up], UsageLog(cfg.usage_log), lambda *a: None, clock=clock, sleep=clock.sleep)
+    batch = [Line(1, "a"), Line(2, "b")]
+    retry, todo = deque(), deque([Line(9, "other")])
+
+    p._server_error(down, batch, "500 internal", retry, todo)  # first failure: never blamed
+    assert list(todo)[-2:] == batch and not retry
+    todo = deque([Line(9, "other")])
+    p.successes["m-up"] += 5  # only the other model got answers since
+    p._server_error(down, batch, "500 internal", retry, todo)
+    assert list(todo)[-2:] == batch and not retry and all(line.max_batch == 0 for line in batch)  # not split
+
+    todo = deque([Line(9, "other")])
+    p.successes["m-down"] += 1  # now the same model works for other batches: this batch is to blame
+    down2.ok_at_failure = down2.ok  # down2 failed before and got no answer since
+    p._server_error(down2, batch, "500 internal", retry, todo)
+    assert list(retry) == batch and all(line.max_batch == 1 for line in batch)  # split
+    assert down2.paused_until > clock.t  # down2 never got an answer: paused although the batch is blamed
