@@ -617,3 +617,15 @@ def test_no_busy_polling_while_only_waiting_for_requests_in_flight(db, cfg, monk
                   ingredients.make_save(db.conn))  # real clock: the lane is ready again after 10 ms
     assert p.run(ingredients.todo_lines(db.conn)) == "done"
     assert len(timeouts) <= 2 and all(t == 2.0 for t in timeouts)
+
+
+def test_lines_commits_in_chunks(db, cfg, monkeypatch):
+    """Review M3: ~2M upserts in one transaction held the write lock for tens of seconds."""
+    monkeypatch.setattr(ingredients, "LINES_CHUNK", 2)
+    add_recipe(db.conn, ["a", "b", "c", "d", "e", "x" * 201])
+    commits = []
+    db.conn.set_trace_callback(lambda sql: commits.append(sql) if sql == "COMMIT" else None)
+    ingredients.collect_lines(db.conn, cfg)
+    db.conn.set_trace_callback(None)
+    assert len(commits) == 3 + 1  # 6 lines in chunks of 2, then the status update
+    assert len(statuses(db.conn)) == 6 and statuses(db.conn)["x" * 201] == -2

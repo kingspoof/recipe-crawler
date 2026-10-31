@@ -56,6 +56,9 @@ def norm(line: object) -> str:
 # --------------------------------------------------------------------------- step 1: lines
 
 
+LINES_CHUNK = 50_000  # upserts per transaction in `lines`
+
+
 def collect_lines(conn: sqlite3.Connection, cfg: IngredientSettings) -> None:
     """Adds new lines, updates counts and original spellings. Status, items etc. of existing lines stay."""
     ensure_schema(conn)
@@ -83,12 +86,14 @@ def collect_lines(conn: sqlite3.Connection, cfg: IngredientSettings) -> None:
         b = best.get(key)
         rows.append((key, n, b[1] if b and b[0] > n - other[key] else None))  # beats the lowercase spelling
     del counts, best, other
+    for i in range(0, len(rows), LINES_CHUNK):  # short transactions: `crawl` keeps writing in between
+        with _tx(conn):
+            conn.executemany(
+                """INSERT INTO ingredient_lines (line, n, original) VALUES (?, ?, ?)
+                   ON CONFLICT(line) DO UPDATE SET n = excluded.n, original = excluded.original""",
+                rows[i:i + LINES_CHUNK],
+            )
     with _tx(conn):
-        conn.executemany(
-            """INSERT INTO ingredient_lines (line, n, original) VALUES (?, ?, ?)
-               ON CONFLICT(line) DO UPDATE SET n = excluded.n, original = excluded.original""",
-            rows,
-        )
         conn.execute("UPDATE ingredient_lines SET status = -2 WHERE status = 0 AND length(line) > ?",
                      (cfg.max_line_chars,))
     log.info("%s distinct lines in %.0f s", f"{len(rows):,}", time.time() - t)
