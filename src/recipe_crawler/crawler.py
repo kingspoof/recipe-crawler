@@ -37,7 +37,8 @@ MAX_INCOMPLETE_DISCOVERIES = 3
 MAX_REDIRECTS = 5
 REDIRECTS = (301, 302, 303, 307, 308)
 # After a stop request, workers get this long to finish the request in flight, then they are cancelled
-# (the URL stays pending). Below systemd's TimeoutStopSec=90 in deploy/recipe-crawler.service.
+# (the URL stays pending). With a blocked DB write (up to 60 s busy timeout) still below systemd's
+# TimeoutStopSec=150 in deploy/recipe-crawler.service.
 STOP_GRACE = 30.0
 
 

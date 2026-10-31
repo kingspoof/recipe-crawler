@@ -86,7 +86,9 @@ uv run recipe-crawler check           # quick_check of the newest backups; exit 
 - **Schema versions** live in `src/recipe_crawler/schema.py` (`PRAGMA user_version`). A migration runs on the
   first write command after an update, takes a full backup first when it changes data, and refuses to run while
   another `recipe-crawler` process uses the database. Read-only commands (`stats`, `export`, `names`,
-  `process --dry-run`) open the database read-only and never migrate. Old code refuses a newer database.
+  `process --dry-run`) open the database read-only and never migrate. Code from this version on refuses a
+  database with a newer schema; older checkouts (before schema versioning) do not check, so don't run them
+  against a migrated database.
 - Only one `crawl`, `process`, `map`, `lines` or `backup` runs at a time per database.
 - **Don't**: `cp` the database while anything runs, delete `-wal` / `-shm` files while anything runs, `VACUUM`
   during a crawl, or `DROP COLUMN` (rewrites all 7 GB).
