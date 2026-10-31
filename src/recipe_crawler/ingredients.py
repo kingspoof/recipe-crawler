@@ -7,7 +7,8 @@
 
 Tables (all created / migrated here, additively, on the first write command):
 - ingredient_lines: notebook schema + `original` (nullable).
-  status 0 = to do, 1 = done, -1 = model left it out max_attempts times, -2 = skipped (too long).
+  status 0 = to do, 1 = done, -1 = model left it out max_attempts times, -2 = skipped (too long),
+  -3 = gave up after repeated server errors on this line alone (safe to reset to 0).
   items: JSON [[name, amount, unit], ...] exactly as the model returned them; cleanup happens in `map`.
 - recipe_ingredients: notebook schema, recipe_id = recipes.id.
 - recipe_ingredients_state: one row per mapped recipe: when it was mapped and how many of its lines were still
@@ -30,7 +31,7 @@ from .db import transaction as _tx
 from .schema import RECIPE_INGREDIENTS
 from .schema import columns as _columns
 from .schema import has_table as _has_table
-from .gemini import (PROMPT, Client, GeminiClient, Lane, Line, UsageLog, fingerprint, next_reset, quota_day,
+from .gemini import (GAVE_UP, PROMPT, Client, GeminiClient, Lane, Line, UsageLog, fingerprint, next_reset, quota_day,
                      spool_read)
 
 log = logging.getLogger("ingredients")
@@ -106,7 +107,7 @@ def todo_lines(conn: sqlite3.Connection) -> list[Line]:
 
 
 def make_save(conn: sqlite3.Connection):
-    def save(answered: list[tuple[int, list]], failed: list[int], model: str) -> None:
+    def save(answered: list[tuple[int, list]], failed: list[int], model: str, gave_up: list[int] = ()) -> None:  # type: ignore[assignment]
         now = time.time()
         with _tx(conn):
             conn.executemany(
@@ -114,6 +115,7 @@ def make_save(conn: sqlite3.Connection):
                 [(json.dumps(items, ensure_ascii=False), model, now, id) for id, items in answered],
             )
             conn.executemany("UPDATE ingredient_lines SET status = -1 WHERE id = ?", [(id,) for id in failed])
+            conn.executemany(f"UPDATE ingredient_lines SET status = {GAVE_UP} WHERE id = ?", [(id,) for id in gave_up])
     return save
 
 
@@ -157,10 +159,10 @@ def apply_spool(conn: sqlite3.Connection, cfg: IngredientSettings) -> int:
     if not records and not path.exists():
         return 0
     save = make_save(conn)
-    for answered, failed, model in records:
-        save(answered, failed, model)
+    for answered, failed, model, gave_up in records:
+        save(answered, failed, model, gave_up)
     path.unlink()
-    n = sum(len(a) for a, _, _ in records)
+    n = sum(len(r[0]) for r in records)
     log.info("applied %s answers from %s", f"{n:,}", path)
     return n
 
@@ -337,7 +339,8 @@ def progress(conn: sqlite3.Connection) -> list[str]:
     all_lines = max(sum(c for c, _ in rows.values()), 1)
     all_uses = max(sum(n for _, n in rows.values()), 1)
     out = []
-    for status, name in [(1, "done"), (0, "to do"), (-1, "failed"), (-2, "skipped (too long)")]:
+    for status, name in [(1, "done"), (0, "to do"), (-1, "failed"), (GAVE_UP, "gave up (server errors)"),
+                         (-2, "skipped (too long)")]:
         c, n = rows.get(status, (0, 0))
         out.append(f"{name:20} {c:>10,} distinct lines ({c / all_lines:6.1%})   "
                    f"covering {n:>10,} recipe lines ({n / all_uses:6.1%})")

@@ -415,15 +415,40 @@ def test_per_day_429_remembered_by_next_run(db, cfg):
     assert usage.exhausted == {(fingerprint("k1"), "m")}
 
 
-def test_always_failing_batch_is_charged_instead_of_burning_the_quota(db, cfg):
-    """Regression: a batch that always got a 500 went back to the front with the same attempt count."""
+def test_network_outage_never_fails_lines(db, cfg):
+    """Regression (review B1): ConnectError on the first 24 calls left innocent lines at -1."""
     add_lines(db.conn, "a", "b")
-    client = FakeClient(lambda n, lines: (_ for _ in ()).throw(ApiError(500, "internal")))
+    client = FakeClient(lambda n, lines: (_ for _ in ()).throw(ConnectionError("down")) if n <= 24 else None)
+    clock = FakeClock()
+    p, reason = run(db, cfg, [client], clock=clock)
+    assert reason == "done" and statuses(db.conn) == {"a": 1, "b": 1} and p.failed == 0
+    assert clock.t > 1000 + 2 * 60  # the lane paused during the outage
+
+
+def test_service_wide_5xx_never_fails_lines(db, cfg):
+    cfg.batch_size = 1
+    add_lines(db.conn, "a", "b", "c")
+    client = FakeClient(lambda n, lines: (_ for _ in ()).throw(ApiError(500, "internal")) if n <= 40 else None)
     p, reason = run(db, cfg, [client])
-    # max_attempts = 2, charged after MAX_TRANSIENT = 2 failed calls, each call = 1 + MAX_RETRIES requests
-    assert reason == "done" and len(client.calls) == 2 * 2 * (1 + gemini.MAX_RETRIES)
-    assert statuses(db.conn) == {"a": -1, "b": -1}
-    assert p.failed == 2
+    assert reason == "done" and set(statuses(db.conn).values()) == {1} and p.failed == 0
+
+
+def test_batch_specific_5xx_is_split_down_to_the_bad_line(db, cfg):
+    cfg.batch_size = 4
+    add_lines(db.conn, "a", "b", "poison", "d", "e", "f", "g", "h")
+
+    def handler(n, lines):
+        if any(text == "poison" for _, text in lines):
+            raise ApiError(500, "internal")
+
+    client = FakeClient(handler)
+    p, reason = run(db, cfg, [client])
+    assert reason == "done"
+    assert statuses(db.conn) == {"a": 1, "b": 1, "poison": gemini.GAVE_UP, "d": 1, "e": 1, "f": 1, "g": 1, "h": 1}
+    poisoned = [c for c in client.calls if "poison" in c]
+    # 4 -> 2 -> 1, each call = 1 + MAX_RETRIES requests: a bounded cost, not the whole day
+    assert [len(c) for c in poisoned][-1] == 1 and len(poisoned) <= 6 * (1 + gemini.MAX_RETRIES)
+    assert any("gave up" in row for row in ingredients.progress(db.conn))
 
 
 def test_429_is_never_charged_to_the_lines(db, cfg):
@@ -471,7 +496,7 @@ def test_unwritable_database_spools_answers_and_stops(db, cfg):
     add_lines(db.conn, "a", "b", "c")
     calls = []
 
-    def save(answered, failed, model):
+    def save(answered, failed, model, gave_up=()):
         calls.append(len(answered))
         raise sqlite3.OperationalError("database or disk is full")
 

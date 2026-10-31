@@ -29,10 +29,13 @@ log = logging.getLogger("gemini")
 QUOTA_TZ = ZoneInfo("America/Los_Angeles")  # daily quotas reset at midnight Pacific time
 RETRY_WAIT = 15.0  # 5xx / network: 15, 30, 60, 120, 240 s
 MAX_RETRIES = 5
-# A batch whose request failed this often with 5xx / network errors (each time after MAX_RETRIES retries) is
-# charged one attempt per line, like lines the model left out. Otherwise one batch that always gets a 500 goes
-# back to the front of the queue forever and uses up the whole day's quota.
+# Requests that fail with 5xx / network errors (each after MAX_RETRIES retries) are never charged to the lines
+# like a line the model left out. Network errors (no answer at all) pause the lane. A 5xx is only blamed on the
+# batch when other requests succeeded since this batch last failed; then the batch is split in halves, down to
+# one line, and a single line that fails like that MAX_TRANSIENT times gets status GAVE_UP (-3, safe to reset).
+# Otherwise one batch that always gets a 500 could go back to the front forever and use up the day's quota.
 MAX_TRANSIENT = 2
+GAVE_UP = -3
 # What a network problem looks like from google-genai (it uses httpx). Anything else is a bug and is raised.
 NETWORK_ERRORS = (httpx.HTTPError, OSError, TimeoutError)
 
@@ -303,6 +306,7 @@ class Lane:
         self.next_at = 0.0  # rate limit
         self.paused_until = 0.0  # after a 429
         self.n_429 = 0
+        self.n_transient = 0  # network / unexplained 5xx failures in a row
         self.exhausted = False  # today's quota is used up (by our count or by a 429 PerDay)
 
     def check_quota(self) -> None:
@@ -315,6 +319,16 @@ class Lane:
     def ready(self, now: float, in_flight: int) -> bool:
         self.check_quota()
         return not self.exhausted and self.in_flight < in_flight and now >= max(self.next_at, self.paused_until)
+
+    def got_transient(self, now: float, error: str) -> None:
+        """Network error or a 5xx not blamed on the batch: pause 2, 4, 8, 16, 30, 30 ... min, so an outage
+        does not keep every lane busy failing. Reset by the next success."""
+        if now < self.paused_until:
+            return
+        self.n_transient += 1
+        self.paused_until = now + min(60 * 2 ** self.n_transient, 1800)
+        log.warning("%s: %s (#%d in a row), pausing %.0f min", self.name, error[:100], self.n_transient,
+                    (self.paused_until - now) / 60)
 
     def got_429(self, now: float, details: str = "") -> None:
         if "PerDay" in details:  # the daily quota of this project is used up
@@ -336,23 +350,27 @@ class Line:
     id: int
     text: str  # what is sent: the original spelling if there is one, else the lowercase key
     attempts: int = 0  # times the model left it out so far
-    transient: int = 0  # requests with this line that failed with 5xx / network since the last charge
+    server_errors: int = 0  # 5xx blamed on this line alone (batch of one, others succeeded in between)
+    failed_mark: int | None = None  # Processor.successes when its batch last failed with a 5xx
+    max_batch: int = 0  # after a split: at most this many lines per batch (0 = batch_size)
 
 
-# save(answered [(line id, items)], failed [line id], model)
-SaveFn = Callable[[list[tuple[int, list]], list[int], str], None]
+# save(answered [(line id, items)], failed [line id], model, gave_up [line id])
+SaveFn = Callable[..., None]
 SAVE_TRIES = 3
 
 
-def spool_write(path: Path, answered: list[tuple[int, list]], failed: list[int], model: str) -> None:
+def spool_write(path: Path, answered: list[tuple[int, list]], failed: list[int], model: str,
+                gave_up: list[int] = ()) -> None:  # type: ignore[assignment]
     """Answers that could not be saved to the database (locked, disk full, ...): applied on the next run."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
-        f.write(json.dumps({"answered": answered, "failed": failed, "model": model}, ensure_ascii=False) + "\n")
+        f.write(json.dumps({"answered": answered, "failed": failed, "model": model, "gave_up": list(gave_up)},
+                           ensure_ascii=False) + "\n")
         f.flush()
 
 
-def spool_read(path: Path) -> list[tuple[list[tuple[int, list]], list[int], str]]:
+def spool_read(path: Path) -> list[tuple[list[tuple[int, list]], list[int], str, list[int]]]:
     out = []
     try:
         with open(path) as f:
@@ -361,7 +379,8 @@ def spool_read(path: Path) -> list[tuple[list[tuple[int, list]], list[int], str]
                     rec = json.loads(line)
                 except json.JSONDecodeError:  # half-written line after a hard abort
                     continue
-                out.append(([(id, items) for id, items in rec["answered"]], rec["failed"], rec["model"]))
+                out.append(([(id, items) for id, items in rec["answered"]], rec["failed"], rec["model"],
+                            rec.get("gave_up", [])))
     except FileNotFoundError:
         pass
     return out
@@ -384,13 +403,22 @@ class Processor:
         self.sent = self.done = self.failed = 0
         self.tokens: Counter[str] = Counter()
         self.error: BaseException | None = None  # a bug in a worker thread: raised after the requests in flight
+        self.successes = 0  # requests that got an answer: evidence that a 5xx is the batch's fault
+        self.spooling = False  # the database failed: everything else goes straight to the spool
 
-    def save(self, answered: list[tuple[int, list]], failed: list[int], model: str) -> None:
+    def save(self, answered: list[tuple[int, list]], failed: list[int], model: str, gave_up: list[int] = ()) -> None:  # type: ignore[assignment]
         """Saves with retries. If the database still fails, the answers go to the spool file and sending stops,
-        so the requests in flight (paid with quota) are not lost."""
+        so the requests in flight (paid with quota) are not lost. Once spooling, later answers go straight to
+        the spool: no more tries against a broken database, so stopping stays quick."""
+        if self.spooling and self.spool is not None:
+            spool_write(self.spool, answered, failed, model, gave_up)
+            return
         for attempt in range(SAVE_TRIES):
             try:
-                self._save_fn(answered, failed, model)
+                if gave_up:
+                    self._save_fn(answered, failed, model, list(gave_up))
+                else:
+                    self._save_fn(answered, failed, model)
                 return
             except Exception as e:  # sqlite3.OperationalError (locked, disk full, ...)
                 log.warning("saving %d answers failed (%s), try %d/%d", len(answered), e, attempt + 1, SAVE_TRIES)
@@ -399,7 +427,8 @@ class Processor:
                     continue
                 if self.spool is None:
                     raise
-                spool_write(self.spool, answered, failed, model)
+                spool_write(self.spool, answered, failed, model, gave_up)
+                self.spooling = True
                 if not self.stopping:
                     log.error("database not writable: answers go to %s (applied by the next `process`); "
                               "no new requests", self.spool)
@@ -427,9 +456,14 @@ class Processor:
         futures: dict[Future, tuple[Lane, list[Line]]] = {}
 
         def take_batch() -> list[Line]:
+            queue = retry or todo
+            limit = queue[0].max_batch or cfg.batch_size  # the halves of a split batch go out on their own
             batch = []
-            while len(batch) < cfg.batch_size and (retry or todo):
-                batch.append((retry or todo).popleft())
+            while len(batch) < min(limit, cfg.batch_size) and (retry or todo):
+                queue = retry or todo
+                if batch and queue[0].max_batch != batch[0].max_batch:
+                    break
+                batch.append(queue.popleft())
             return batch
 
         def may_send() -> bool:
@@ -481,7 +515,7 @@ class Processor:
                     lane, batch = futures.pop(future)
                     lane.in_flight -= 1
                     try:
-                        self._finished(lane, batch, future.result(), retry, started, total, len(todo))
+                        self._finished(lane, batch, future.result(), retry, started, total, len(todo), todo)
                     except Exception as e:  # a bug: stop sending, but wait for and save what is in flight
                         log.exception("%s: request failed with an unexpected error, stopping", lane.name)
                         retry.extendleft(reversed(batch))
@@ -493,15 +527,56 @@ class Processor:
             raise self.error
         return reason
 
+    def _server_error(self, lane: Lane, batch: list[Line], error: str, retry: deque[Line], todo: deque[Line]) -> None:
+        """Network error or 5xx: never counted as an attempt. See MAX_TRANSIENT."""
+        marks = [line.failed_mark for line in batch]
+        failed_before = None not in marks
+        others_ok = failed_before and self.successes > max(m for m in marks if m is not None)
+        # Nothing else left to send: no other batch can show whether the service works. Then a second failure
+        # is blamed on the batch anyway; if that is wrong (an outage at the very end), the worst case is a
+        # few lines at GAVE_UP, which can be reset.
+        alone = not retry and not todo
+        blamed = not error.startswith("network") and failed_before and (others_ok or alone)
+        for line in batch:
+            line.failed_mark = self.successes
+        if not blamed:
+            # No answer at all, or nothing else got through since this batch last failed: the network or the
+            # service is the problem. Pause the lane; a 5xx batch goes to the back, so other batches show
+            # whether it is this batch (they succeed) or the service (they fail too).
+            lane.got_transient(self.clock(), error)
+            if error.startswith("network"):
+                retry.extendleft(reversed(batch))
+            else:
+                todo.extend(batch)
+            return
+        if len(batch) > 1:
+            half = (len(batch) + 1) // 2
+            for line in batch:
+                line.max_batch = half
+            retry.extendleft(reversed(batch))
+            log.warning("%s: %s again while other requests succeed: splitting the batch of %d", lane.name,
+                        error[:100], len(batch))
+            return
+        line = batch[0]
+        line.server_errors += 1
+        if line.server_errors < MAX_TRANSIENT:
+            retry.appendleft(line)
+            return
+        log.warning("%s: line %d keeps getting %s on its own: giving up (status %d)", lane.name, line.id,
+                    error[:60], GAVE_UP)
+        self.save([], [], lane.model, [line.id])
+        self.failed += 1
+
     def _finished(self, lane: Lane, batch: list[Line], outcome: tuple[Any, dict], retry: deque[Line],
-                  started: float, total: int, todo_left: int) -> None:
+                  started: float, total: int, todo_left: int, todo: deque[Line] | None = None) -> None:
         result, rec = outcome
         error = rec.get("error", "")
         lane.used += rec.get("retries", 0)  # every retry inside call() was a request too
         if error.startswith("429"):
             lane.got_429(self.clock(), rec.get("details", ""))
-        elif not error:
-            lane.n_429 = 0
+        elif result is not None:  # an answer (also bad or cut-off JSON): the service and the network work
+            lane.n_429 = lane.n_transient = 0
+            self.successes += 1
         if result is None and re.match(r"4\d\d ", error) and not error.startswith("429"):
             # bad key (400/403), unknown model (404), ...: not the lines' fault, and retrying will not help
             retry.extendleft(reversed(batch))
@@ -510,28 +585,12 @@ class Processor:
             lane.exhausted = True
             return
         if result is None and transient(rec):
-            if not error.startswith("429"):
-                for line in batch:
-                    line.transient += 1
-            charged = [line for line in batch if line.transient >= MAX_TRANSIENT]
-            if not charged:
-                retry.extendleft(reversed(batch))  # not the lines' fault: same attempt count
+            if error.startswith("429"):
+                retry.extendleft(reversed(batch))  # quota, not the lines' fault
                 quota_ids = sorted(set(re.findall(r'"quotaId": "([^"]+)"', rec.get("details", ""))))
                 log.warning("%s: %s, batch goes back in the queue %s", lane.name, error[:100], ", ".join(quota_ids))
                 return
-            failed = []
-            for line in batch:
-                line.transient = 0
-                line.attempts += 1
-                if line.attempts >= self.cfg.max_attempts:
-                    failed.append(line.id)
-                else:
-                    retry.append(line)  # to the back, so it is sent in a different batch next time
-            log.warning("%s: %s, %d failed requests in a row for this batch: charged one attempt (%d lines failed)",
-                        lane.name, error[:100], MAX_TRANSIENT, len(failed))
-            if failed:
-                self.save([], failed, lane.model)
-                self.failed += len(failed)
+            self._server_error(lane, batch, error, retry, todo if todo is not None else retry)
             return
         parsed = parse(len(batch), result)
         # Cut off at MAX_TOKENS: the lines after the cut were never reached, so they are not charged. The line
