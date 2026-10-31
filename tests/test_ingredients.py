@@ -1,10 +1,11 @@
 import json
 import sqlite3
 import time
+from collections import deque
 
 import pytest
 
-from recipe_crawler import gemini, ingredients
+from recipe_crawler import gemini, ingredients, schema
 from recipe_crawler.config import IngredientSettings, load_config
 from recipe_crawler.db import DB
 from recipe_crawler.gemini import ApiError, Lane, Line, Processor, Reply, UsageLog, fingerprint
@@ -58,10 +59,17 @@ def cfg(tmp_path):
                               usage_log=tmp_path / "usage.jsonl", keys_file=tmp_path / "keys.txt")
 
 
+def notebook_db(path):
+    """recipes.db as it was before schema versioning: crawler tables + the notebook's ingredient_lines."""
+    con = sqlite3.connect(path)
+    con.executescript(schema.CRAWLER_TABLES + NOTEBOOK_LINES)
+    con.close()
+
+
 @pytest.fixture
 def db(tmp_path):
-    d = DB(tmp_path / "recipes.db")
-    d.conn.executescript(NOTEBOOK_LINES)
+    notebook_db(tmp_path / "recipes.db")
+    d = DB(tmp_path / "recipes.db")  # migrates
     yield d
     d.close()
 
@@ -347,10 +355,11 @@ def test_cli_dry_run_and_stats(tmp_path, capsys):
     path = tmp_path / "config.toml"
     path.write_text('[crawler]\ncontact = ""\ndb_path = "r.db"\n')
     (tmp_path / "gemini_keys.txt").write_text("k1\n")
-    d = DB(tmp_path / "r.db")
-    d.conn.executescript(NOTEBOOK_LINES)
-    d.conn.execute("INSERT INTO ingredient_lines (line, n) VALUES ('a', 1)")
-    d.close()
+    notebook_db(tmp_path / "r.db")
+    con = sqlite3.connect(tmp_path / "r.db")
+    con.execute("INSERT INTO ingredient_lines (line, n) VALUES ('a', 1)")
+    con.commit()
+    con.close()
     from recipe_crawler.cli import main
 
     main(["-c", str(path), "process", "--dry-run", "--keys", str(tmp_path / "gemini_keys.txt")])
@@ -405,3 +414,292 @@ def test_per_day_429_remembered_by_next_run(db, cfg):
     usage = UsageLog(cfg.usage_log)
     assert usage.used_today(["k1"])[fingerprint("k1"), "m"] == 1
     assert usage.exhausted == {(fingerprint("k1"), "m")}
+
+
+def test_network_outage_never_fails_lines(db, cfg):
+    """Regression (review B1): ConnectError on the first 24 calls left innocent lines at -1."""
+    add_lines(db.conn, "a", "b")
+    client = FakeClient(lambda n, lines: (_ for _ in ()).throw(ConnectionError("down")) if n <= 24 else None)
+    clock = FakeClock()
+    p, reason = run(db, cfg, [client], clock=clock)
+    assert reason == "done" and statuses(db.conn) == {"a": 1, "b": 1} and p.failed == 0
+    assert clock.t > 1000 + 2 * 60  # the lane paused during the outage
+
+
+def test_service_wide_5xx_never_fails_lines(db, cfg):
+    cfg.batch_size = 1
+    add_lines(db.conn, "a", "b", "c")
+    client = FakeClient(lambda n, lines: (_ for _ in ()).throw(ApiError(500, "internal")) if n <= 40 else None)
+    p, reason = run(db, cfg, [client])
+    assert reason == "done" and set(statuses(db.conn).values()) == {1} and p.failed == 0
+
+
+def test_batch_specific_5xx_is_split_down_to_the_bad_line(db, cfg):
+    cfg.batch_size = 4
+    add_lines(db.conn, "a", "b", "poison", "d", "e", "f", "g", "h")
+
+    def handler(n, lines):
+        if any(text == "poison" for _, text in lines):
+            raise ApiError(500, "internal")
+
+    client = FakeClient(handler)
+    p, reason = run(db, cfg, [client])
+    assert reason == "done"
+    assert statuses(db.conn) == {"a": 1, "b": 1, "poison": gemini.GAVE_UP, "d": 1, "e": 1, "f": 1, "g": 1, "h": 1}
+    poisoned = [c for c in client.calls if "poison" in c]
+    # 4 -> 2 -> 1, each call = 1 + MAX_RETRIES requests: a bounded cost, not the whole day
+    assert [len(c) for c in poisoned][-1] == 1 and len(poisoned) <= 6 * (1 + gemini.MAX_RETRIES)
+    assert any("gave up" in row for row in ingredients.progress(db.conn))
+
+
+def test_429_is_never_charged_to_the_lines(db, cfg):
+    add_lines(db.conn, "a")
+    clock = FakeClock()
+    client = FakeClient(lambda n, lines: (_ for _ in ()).throw(ApiError(429, "slow down", {})) if n <= 3 else None)
+    run(db, cfg, [client], clock=clock)
+    assert statuses(db.conn) == {"a": 1}
+
+
+def test_local_bug_is_not_a_network_error(db, cfg):
+    add_lines(db.conn, "a")
+    client = FakeClient(lambda n, lines: (_ for _ in ()).throw(TypeError("bug in our code")))
+    with pytest.raises(TypeError):
+        run(db, cfg, [client])
+    assert len(client.calls) == 1  # not retried 5 times as if it were a connection reset
+
+
+def test_truncated_answer_keeps_complete_objects(db, cfg):
+    """Regression: a MAX_TOKENS answer failed the whole batch; after 2 tries every line was -1."""
+    cfg.batch_size = 4
+    add_lines(db.conn, "a", "b", "c", "d")
+
+    def handler(n, lines):
+        if n == 1:
+            text = answer(lines).text
+            return Reply(text[:text.index('{"i": 2')] + '{"i": 2, "en": "c', {}, "MAX_TOKENS")  # cut inside c
+
+    client = FakeClient(handler)
+    run(db, cfg, [client])
+    assert statuses(db.conn) == {"a": 1, "b": 1, "c": 1, "d": 1}
+    assert client.calls == [["a", "b", "c", "d"], ["c", "d"]]
+    rec = usage_records(cfg)[0]
+    assert rec["truncated"] == 2 and rec["error"].startswith("bad json")
+
+
+def test_salvage():
+    assert gemini.salvage('[{"i": 0}, {"i": 1}, {"i"') == [{"i": 0}, {"i": 1}]
+    assert gemini.salvage("[") == [] and gemini.salvage("oops") == []
+
+
+def test_unwritable_database_spools_answers_and_stops(db, cfg):
+    """Regression: an error in save() crashed the loop and lost every request in flight."""
+    cfg.batch_size = 1
+    add_lines(db.conn, "a", "b", "c")
+    calls = []
+
+    def save(answered, failed, model, gave_up=()):
+        calls.append(len(answered))
+        raise sqlite3.OperationalError("database or disk is full")
+
+    clock = FakeClock()
+    usage = UsageLog(cfg.usage_log)
+    client = FakeClient()
+    p = Processor(cfg, [Lane("k1", client, "m", 0, cfg.rpd)], usage, save, clock=clock, sleep=clock.sleep,
+                  retry_sleep=lambda s: None, spool=ingredients.spool_path(cfg))
+    assert p.run(ingredients.todo_lines(db.conn)) == "stopped"
+    assert len(calls) == gemini.SAVE_TRIES and len(client.calls) == 1  # retried, then no new requests
+    assert set(statuses(db.conn).values()) == {0}
+
+    assert ingredients.apply_spool(db.conn, cfg) == 1  # the next `process` saves them first
+    assert statuses(db.conn)["a"] == 1 and not ingredients.spool_path(cfg).exists()
+    assert ingredients.apply_spool(db.conn, cfg) == 0
+
+
+def test_bug_in_finished_waits_for_in_flight_then_raises(db, cfg, monkeypatch):
+    cfg.in_flight = 2
+    add_lines(db.conn, "a", "b", "c", "d")
+    client = FakeClient(lambda n, lines: time.sleep(0.1) or None)  # both requests in flight at the same time
+    p = Processor(cfg, [Lane("k1", client, "m", 0, cfg.rpd)], UsageLog(cfg.usage_log),
+                  ingredients.make_save(db.conn))  # real clock: rpm 6000 = 10 ms between requests
+    real = p._finished
+    n = []
+
+    def finished(*a):
+        n.append(1)
+        if len(n) == 1:
+            raise KeyError("bug")
+        return real(*a)
+
+    monkeypatch.setattr(p, "_finished", finished)
+    with pytest.raises(KeyError):
+        p.run(ingredients.todo_lines(db.conn))
+    assert len(client.calls) == 2 and list(statuses(db.conn).values()).count(1) == 2  # the other one was saved
+
+
+def test_build_lanes_starts_per_day_429_lanes_exhausted(cfg):
+    cfg.models = ["m1", "m2"]
+    usage = UsageLog(cfg.usage_log)
+    usage.write({"day": gemini.quota_day(), "key": fingerprint("k1"), "model": "m2", "details": "PerDay"})
+    used = usage.used_today(["k1"])
+    lanes = ingredients.build_lanes(cfg, ["k1"], usage, used, client=lambda k: FakeClient())
+    assert [(lane.model, lane.used, lane.exhausted) for lane in lanes] == [("m1", 0, False), ("m2", 1, True)]
+
+
+def test_map_full_crash_keeps_the_old_table_and_writers_get_in_between(db, cfg, monkeypatch, tmp_path):
+    ingredients.ensure_schema(db.conn)
+    for i in range(5):
+        add_recipe(db.conn, ["1 egg"])
+    done(db.conn, "1 egg", [["egg", 1, None]], 1)
+    ingredients.map_ingredients(db.conn, cfg)
+    before = ri(db.conn)
+    monkeypatch.setattr(ingredients, "FULL_CHUNK", 2)
+
+    other = sqlite3.connect(tmp_path / "recipes.db", timeout=0, isolation_level=None)
+    calls = []
+    real_norm = ingredients.norm
+
+    def norm(x):
+        calls.append(x)
+        if len(calls) == 3:  # between chunk 1 and 2: another process writes (would fail if map held the lock)
+            other.execute("INSERT INTO domains(domain) VALUES ('written during map --full')")
+        if len(calls) == 5:
+            raise MemoryError("crash in the middle")
+        return real_norm(x)
+
+    monkeypatch.setattr(ingredients, "norm", norm)
+    with pytest.raises(MemoryError):
+        ingredients.map_ingredients(db.conn, cfg, full=True)
+    assert not db.conn.in_transaction and ri(db.conn) == before  # old table untouched
+    assert other.execute("SELECT COUNT(*) FROM domains").fetchone()[0] == 1
+    other.close()
+    monkeypatch.setattr(ingredients, "norm", real_norm)
+    ingredients.map_ingredients(db.conn, cfg, full=True)  # the leftover _new tables are replaced
+    assert ri(db.conn) == before
+    assert not schema.has_table(db.conn, "recipe_ingredients_new")
+
+
+def test_after_the_first_spool_answers_go_straight_to_the_spool(db, cfg):
+    """Regression (review S4): every later answer still tried the broken database 3 times."""
+    cfg.batch_size, cfg.in_flight = 1, 3
+    add_lines(db.conn, "a", "b", "c")
+    tries = []
+
+    def save(answered, failed, model, gave_up=()):
+        tries.append(1)
+        raise sqlite3.OperationalError("database is locked")
+
+    client = FakeClient(lambda n, lines: time.sleep(0.05) or None)  # three requests in flight at once
+    p = Processor(cfg, [Lane("k1", client, "m", 0, cfg.rpd)], UsageLog(cfg.usage_log), save,
+                  retry_sleep=lambda s: None, spool=ingredients.spool_path(cfg))
+    assert p.run(ingredients.todo_lines(db.conn)) == "stopped"
+    assert len(tries) == gemini.SAVE_TRIES  # only the first answer tried the database
+    assert len(gemini.spool_read(ingredients.spool_path(cfg))) == len(client.calls) == 3
+
+
+def test_save_connection_gets_a_short_busy_timeout(db):
+    ingredients.make_save(db.conn)
+    assert db.conn.execute("PRAGMA busy_timeout").fetchone()[0] == ingredients.SAVE_BUSY_TIMEOUT_MS
+
+
+def test_no_busy_polling_while_only_waiting_for_requests_in_flight(db, cfg, monkeypatch):
+    """Regression (review M1): with nothing left to send the loop waited 10 ms at a time."""
+    cfg.batch_size, cfg.in_flight = 1, 2  # the lane could send more: only "nothing left" stops it
+    add_lines(db.conn, "a")
+    timeouts = []
+    real_wait = gemini.wait
+
+    def wait(fs, timeout=None, return_when=None):
+        timeouts.append(timeout)
+        return real_wait(fs, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(gemini, "wait", wait)
+    client = FakeClient(lambda n, lines: time.sleep(0.3) or None)
+    p = Processor(cfg, [Lane("k1", client, "m", 0, cfg.rpd)], UsageLog(cfg.usage_log),
+                  ingredients.make_save(db.conn))  # real clock: the lane is ready again after 10 ms
+    assert p.run(ingredients.todo_lines(db.conn)) == "done"
+    assert len(timeouts) <= 2 and all(t == 2.0 for t in timeouts)
+
+
+def test_lines_commits_in_chunks(db, cfg, monkeypatch):
+    """Review M3: ~2M upserts in one transaction held the write lock for tens of seconds."""
+    monkeypatch.setattr(ingredients, "LINES_CHUNK", 2)
+    add_recipe(db.conn, ["a", "b", "c", "d", "e", "x" * 201])
+    commits = []
+    db.conn.set_trace_callback(lambda sql: commits.append(sql) if sql == "COMMIT" else None)
+    ingredients.collect_lines(db.conn, cfg)
+    db.conn.set_trace_callback(None)
+    assert len(commits) == 3 + 1  # 6 lines in chunks of 2, then the status update
+    assert len(statuses(db.conn)) == 6 and statuses(db.conn)["x" * 201] == -2
+
+
+def test_one_model_down_does_not_blame_its_batches(db, cfg):
+    """Review N1: with a global success counter, a model in a 5xx outage got its batches blamed (split, -3)
+    because another model kept succeeding."""
+    cfg.batch_size, cfg.rpm, cfg.rpd = 2, 60, 10_000  # ~1 request/s per lane: the bad lane retries while work is left
+    add_lines(db.conn, *[f"line {i}" for i in range(4000)])  # ~35 min of work: the bad lanes come back
+    down = FakeClient(lambda n, lines: (_ for _ in ()).throw(ApiError(500, "internal")))
+    up = FakeClient()
+    clock = FakeClock()
+    usage = UsageLog(cfg.usage_log)
+    # like the reviewer's simulation: three keys on the model that is down, one on the model that works
+    lanes = [Lane(k, down, "m-down", 0, cfg.rpd) for k in ("k1", "k2", "k3")] + [Lane("k1", up, "m-up", 0, cfg.rpd)]
+    p, reason = run(db, cfg, None, clock=clock, lanes=lanes)
+    assert reason == "done" and set(statuses(db.conn).values()) == {1} and p.failed == 0
+    assert max(len(c) for c in down.calls) == 2  # never split
+    # each bad lane pauses 2, 4, 8, 16 ... min: a handful of calls per lane, not one per batch (~2000)
+    assert len(down.calls) <= 3 * 6 * (1 + gemini.MAX_RETRIES)
+
+
+
+def test_blame_needs_successes_of_the_same_model(cfg):
+    """Review N1, pinned at the decision: successes of another model do not blame a batch, and a lane that
+    only fails is paused even when its batch is blamed."""
+    clock = FakeClock()
+    down = Lane("k1", FakeClient(), "m-down", 0, cfg.rpd)
+    down2 = Lane("k2", FakeClient(), "m-down", 0, cfg.rpd)
+    up = Lane("k1", FakeClient(), "m-up", 0, cfg.rpd)
+    p = Processor(cfg, [down, down2, up], UsageLog(cfg.usage_log), lambda *a: None, clock=clock, sleep=clock.sleep)
+    batch = [Line(1, "a"), Line(2, "b")]
+    retry, todo = deque(), deque([Line(9, "other")])
+
+    p._server_error(down, batch, "500 internal", retry, todo)  # first failure: never blamed
+    assert list(todo)[-2:] == batch and not retry
+    todo = deque([Line(9, "other")])
+    p.successes["m-up"] += 5  # only the other model got answers since
+    p._server_error(down, batch, "500 internal", retry, todo)
+    assert list(todo)[-2:] == batch and not retry and all(line.max_batch == 0 for line in batch)  # not split
+
+    todo = deque([Line(9, "other")])
+    p.successes["m-down"] += 1  # now the same model works for other batches: this batch is to blame
+    down2.ok_at_failure = down2.ok  # down2 failed before and got no answer since
+    p._server_error(down2, batch, "500 internal", retry, todo)
+    assert list(retry) == batch and all(line.max_batch == 1 for line in batch)  # split
+    assert down2.paused_until > clock.t  # down2 never got an answer: paused although the batch is blamed
+
+
+def test_network_errors_are_never_blamed_on_the_batch(db, cfg):
+    """Review N6: one batch keeps getting network errors while other batches succeed."""
+    cfg.batch_size, cfg.rpm, cfg.rpd = 1, 60, 10_000
+    add_lines(db.conn, "unlucky", *[f"line {i}" for i in range(300)])
+    fails = {"n": 0}
+
+    def handler(n, lines):
+        if lines[0][1] == "unlucky" and fails["n"] < 60:
+            fails["n"] += 1
+            raise ConnectionError("reset")
+
+    # two lanes of the same model: the other one keeps succeeding while "unlucky" fails
+    _, reason = run(db, cfg, [FakeClient(handler), FakeClient(handler)], keys=("k1", "k2"))
+    assert reason == "done" and set(statuses(db.conn).values()) == {1}
+
+def test_network_error_is_not_blamed_even_when_others_succeed(cfg):
+    """Review N6, pinned at the decision."""
+    clock = FakeClock()
+    lane = Lane("k1", FakeClient(), "m", 0, cfg.rpd)
+    p = Processor(cfg, [lane], UsageLog(cfg.usage_log), lambda *a: None, clock=clock, sleep=clock.sleep)
+    batch = [Line(1, "a"), Line(2, "b")]
+    for _ in range(5):
+        retry, todo = deque(), deque([Line(9, "other")])
+        p._server_error(lane, batch, "network ConnectError()", retry, todo)
+        p.successes["m"] += 3  # other batches keep succeeding in between
+        assert list(retry) == batch and all(line.max_batch == 0 and line.server_errors == 0 for line in batch)

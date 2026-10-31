@@ -12,9 +12,10 @@ After=network-online.target
 [Service]
 WorkingDirectory=%h/recipe-crawler
 ExecStart=%h/.local/bin/uv run --frozen recipe-crawler crawl
-# The crawler stops gracefully on SIGTERM (finishes in-flight requests).
+# The crawler stops gracefully on SIGTERM: workers get 30 s to finish their request, then they are cancelled.
+# A database write blocked by another process can add up to 60 s (busy timeout) on top, hence 150 s.
 KillSignal=SIGTERM
-TimeoutStopSec=90
+TimeoutStopSec=150
 # Restart after crashes or network outages, but not after a clean finish.
 Restart=on-failure
 RestartSec=60
