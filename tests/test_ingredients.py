@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from recipe_crawler import gemini, ingredients
+from recipe_crawler import gemini, ingredients, schema
 from recipe_crawler.config import IngredientSettings, load_config
 from recipe_crawler.db import DB
 from recipe_crawler.gemini import ApiError, Lane, Line, Processor, Reply, UsageLog, fingerprint
@@ -58,10 +58,17 @@ def cfg(tmp_path):
                               usage_log=tmp_path / "usage.jsonl", keys_file=tmp_path / "keys.txt")
 
 
+def notebook_db(path):
+    """recipes.db as it was before schema versioning: crawler tables + the notebook's ingredient_lines."""
+    con = sqlite3.connect(path)
+    con.executescript(schema.CRAWLER_TABLES + NOTEBOOK_LINES)
+    con.close()
+
+
 @pytest.fixture
 def db(tmp_path):
-    d = DB(tmp_path / "recipes.db")
-    d.conn.executescript(NOTEBOOK_LINES)
+    notebook_db(tmp_path / "recipes.db")
+    d = DB(tmp_path / "recipes.db")  # migrates
     yield d
     d.close()
 
@@ -347,10 +354,11 @@ def test_cli_dry_run_and_stats(tmp_path, capsys):
     path = tmp_path / "config.toml"
     path.write_text('[crawler]\ncontact = ""\ndb_path = "r.db"\n')
     (tmp_path / "gemini_keys.txt").write_text("k1\n")
-    d = DB(tmp_path / "r.db")
-    d.conn.executescript(NOTEBOOK_LINES)
-    d.conn.execute("INSERT INTO ingredient_lines (line, n) VALUES ('a', 1)")
-    d.close()
+    notebook_db(tmp_path / "r.db")
+    con = sqlite3.connect(tmp_path / "r.db")
+    con.execute("INSERT INTO ingredient_lines (line, n) VALUES ('a', 1)")
+    con.commit()
+    con.close()
     from recipe_crawler.cli import main
 
     main(["-c", str(path), "process", "--dry-run", "--keys", str(tmp_path / "gemini_keys.txt")])

@@ -25,46 +25,16 @@ import time
 from collections import Counter
 from typing import Callable
 from .config import IngredientSettings
+from . import schema
 from .db import transaction as _tx
+from .schema import RECIPE_INGREDIENTS
+from .schema import columns as _columns
+from .schema import has_table as _has_table
 from .gemini import (PROMPT, Client, GeminiClient, Lane, Line, UsageLog, fingerprint, next_reset, quota_day,
                      spool_read)
 
 log = logging.getLogger("ingredients")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS ingredient_lines (
-    id INTEGER PRIMARY KEY,
-    line TEXT NOT NULL UNIQUE,
-    n INTEGER NOT NULL,
-    status INTEGER NOT NULL DEFAULT 0,
-    items TEXT,
-    model TEXT,
-    done_at REAL
-);
-CREATE INDEX IF NOT EXISTS ingredient_lines_todo ON ingredient_lines(status, n DESC);
-
-CREATE TABLE IF NOT EXISTS ingredient_names (
-    name TEXT PRIMARY KEY,
-    canonical TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS recipe_ingredients_state (
-    recipe_id INTEGER PRIMARY KEY,  -- recipes.id
-    mapped_at REAL NOT NULL,
-    pending INTEGER NOT NULL        -- lines of the recipe that were not done yet when it was mapped
-);
-"""
-
-RECIPE_INGREDIENTS = """
-CREATE TABLE IF NOT EXISTS recipe_ingredients (
-    recipe_id INTEGER NOT NULL,  -- recipes.id
-    pos INTEGER NOT NULL,        -- position of the line in the recipe
-    line_id INTEGER NOT NULL,    -- ingredient_lines.id
-    name TEXT NOT NULL,
-    amount REAL,
-    unit TEXT
-);
-"""
 RECIPE_INGREDIENTS_INDEXES = """
 CREATE INDEX IF NOT EXISTS recipe_ingredients_recipe ON recipe_ingredients(recipe_id);
 CREATE INDEX IF NOT EXISTS recipe_ingredients_name ON recipe_ingredients(name);
@@ -72,19 +42,8 @@ CREATE INDEX IF NOT EXISTS recipe_ingredients_name ON recipe_ingredients(name);
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Additive and idempotent: never drops anything, never touches done lines."""
-    conn.executescript(SCHEMA + RECIPE_INGREDIENTS + RECIPE_INGREDIENTS_INDEXES)
-    if "original" not in _columns(conn, "ingredient_lines"):
-        conn.execute("ALTER TABLE ingredient_lines ADD COLUMN original TEXT")  # schema only, instant on 2M rows
-        log.info("migration: added ingredient_lines.original")
-
-
-def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-
-
-def _has_table(conn: sqlite3.Connection, table: str) -> bool:
-    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
+    """Migrates to the current schema version (DB() already does this for write commands). See schema.py."""
+    schema.migrate(conn)
 
 
 def _spelling(line: object) -> str:
@@ -337,7 +296,8 @@ def _map_chunk(conn, chunk, rows_for, started, stats, insert, insert_state) -> N
 
 def names_report(conn: sqlite3.Connection) -> list[str]:
     """Stub of the name standardization step: shows what there is to merge. Merging itself is not built yet."""
-    ensure_schema(conn)
+    if not _has_table(conn, "recipe_ingredients"):
+        return ["no recipe_ingredients yet: run `recipe-crawler map`"]
     distinct, rows = conn.execute("SELECT COUNT(DISTINCT name), COUNT(*) FROM recipe_ingredients").fetchone()
     mapped = conn.execute("SELECT COUNT(*) FROM ingredient_names").fetchone()[0]
     top = conn.execute("SELECT name, COUNT(*) FROM recipe_ingredients GROUP BY 1 ORDER BY 2 DESC LIMIT 20").fetchall()

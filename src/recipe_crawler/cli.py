@@ -98,7 +98,7 @@ def cmd_probe(settings: Settings, args: argparse.Namespace) -> None:
 
 
 def cmd_stats(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path)
+    db = DB(settings.db_path, readonly=True)
     rows = db.stats()
     print(f"{'domain':<34}{'recipes':>9}{'pending':>10}{'done':>9}{'no_rec':>9}{'errors':>8}{'blocked':>9}")
     for r in rows:
@@ -122,7 +122,7 @@ def _fingerprint(rec: dict) -> str:
 
 
 def cmd_export(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path)
+    db = DB(settings.db_path, readonly=True)
     seen: set[str] = set()
     n = dupes = 0
     langs: Counter[str] = Counter()
@@ -166,14 +166,14 @@ def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
     keys = gemini.load_keys(keys_file)
     usage = gemini.UsageLog(cfg.usage_log)
     used = usage.used_today(keys)
-    db = DB(settings.db_path)
     if args.dry_run:  # no migrations, no requests, no usage records
+        db = DB(settings.db_path, readonly=True)
         try:
             print("\n".join(ingredients.dry_run(db.conn, cfg, keys, used, show_prompt=args.verbose)))
         finally:
             db.close()
         return
-    ingredients.ensure_schema(db.conn)
+    db = DB(settings.db_path)
     ingredients.apply_spool(db.conn, cfg)
     lanes = ingredients.build_lanes(cfg, keys, usage, used)
     processor = gemini.Processor(cfg, lanes, usage, ingredients.make_save(db.conn), max_requests=args.max_requests,
@@ -201,7 +201,7 @@ def cmd_map(settings: Settings, args: argparse.Namespace) -> None:
 
 
 def cmd_names(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path)
+    db = DB(settings.db_path, readonly=True)
     print("\n".join(ingredients.names_report(db.conn)))
     db.close()
 

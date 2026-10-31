@@ -8,62 +8,15 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import logging
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
+from . import schema
 from .config import Site
 from .extract import Recipe
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS urls (
-    url         TEXT PRIMARY KEY,
-    domain      TEXT NOT NULL,
-    -- pending | done | no_recipe | error | failed | blocked | gone
-    status      TEXT NOT NULL DEFAULT 'pending',
-    attempts    INTEGER NOT NULL DEFAULT 0,
-    http_status INTEGER,
-    error       TEXT,
-    updated_at  REAL
-);
-CREATE INDEX IF NOT EXISTS urls_domain_status ON urls(domain, status);
-
-CREATE TABLE IF NOT EXISTS domains (
-    domain        TEXT PRIMARY KEY,
-    discovered_at REAL,
-    sitemaps_read INTEGER,
-    urls_found    INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS recipes (
-    id             INTEGER PRIMARY KEY,  -- stable, referenced by recipe_ingredients.recipe_id
-    url            TEXT NOT NULL UNIQUE,
-    domain         TEXT NOT NULL,
-    site_country   TEXT,
-    site_region    TEXT,
-    language       TEXT,
-    name           TEXT NOT NULL,
-    description    TEXT,
-    ingredients    TEXT NOT NULL,  -- JSON list of strings
-    instructions   TEXT NOT NULL,  -- JSON list of strings
-    cuisine        TEXT,           -- JSON list
-    category       TEXT,           -- JSON list
-    keywords       TEXT,           -- JSON list
-    prep_time_min  INTEGER,
-    cook_time_min  INTEGER,
-    total_time_min INTEGER,
-    recipe_yield   TEXT,
-    image          TEXT,
-    author         TEXT,
-    date_published TEXT,
-    rating_value   REAL,
-    rating_count   INTEGER,
-    nutrition      TEXT,           -- JSON object
-    raw            TEXT,           -- original JSON-LD node
-    crawled_at     REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS recipes_domain ON recipes(domain);
-"""
 
 _JSON_FIELDS = ("ingredients", "instructions", "cuisine", "category", "keywords", "nutrition")
 
@@ -93,15 +46,38 @@ def transaction(conn: sqlite3.Connection, immediate: bool = True) -> Iterator[No
     conn.execute("COMMIT")
 
 
+log = logging.getLogger("db")
+
+
 class DB:
-    def __init__(self, path: Path, timeout: float = BUSY_TIMEOUT):
-        if str(path) != ":memory:":
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=timeout)
+    """readonly: for commands that only read (stats, export, dry runs). Opened with mode=ro, so nothing, not even
+    a migration, can write; a missing database is an error instead of an empty new file.
+
+    Otherwise the schema is migrated to the current version on open (schema.py); `backup` is called first if
+    a migration needs a full backup."""
+
+    def __init__(self, path: Path, timeout: float = BUSY_TIMEOUT, readonly: bool = False,
+                 backup: Callable[[], object] | None = None):
+        memory = str(path) == ":memory:"
+        if readonly and not memory:
+            if not Path(path).exists():
+                raise SystemExit(f"No database at {path}: run `recipe-crawler crawl` first.")
+            self.conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True,
+                                        isolation_level=None, check_same_thread=False, timeout=timeout)
+        else:
+            if not memory:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=timeout)
         self.conn.row_factory = sqlite3.Row
+        if readonly:
+            v = schema.version(self.conn)
+            if v != schema.CURRENT:
+                log.warning("database is at schema version %d, this code at %d: a write command migrates it",
+                            v, schema.CURRENT)
+            return
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.executescript(SCHEMA)
+        schema.migrate(self.conn, backup)
 
     def close(self) -> None:
         self.conn.close()
