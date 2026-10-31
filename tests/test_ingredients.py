@@ -575,3 +575,26 @@ def test_map_full_crash_keeps_the_old_table_and_writers_get_in_between(db, cfg, 
     ingredients.map_ingredients(db.conn, cfg, full=True)  # the leftover _new tables are replaced
     assert ri(db.conn) == before
     assert not schema.has_table(db.conn, "recipe_ingredients_new")
+
+
+def test_after_the_first_spool_answers_go_straight_to_the_spool(db, cfg):
+    """Regression (review S4): every later answer still tried the broken database 3 times."""
+    cfg.batch_size, cfg.in_flight = 1, 3
+    add_lines(db.conn, "a", "b", "c")
+    tries = []
+
+    def save(answered, failed, model, gave_up=()):
+        tries.append(1)
+        raise sqlite3.OperationalError("database is locked")
+
+    client = FakeClient(lambda n, lines: time.sleep(0.05) or None)  # three requests in flight at once
+    p = Processor(cfg, [Lane("k1", client, "m", 0, cfg.rpd)], UsageLog(cfg.usage_log), save,
+                  retry_sleep=lambda s: None, spool=ingredients.spool_path(cfg))
+    assert p.run(ingredients.todo_lines(db.conn)) == "stopped"
+    assert len(tries) == gemini.SAVE_TRIES  # only the first answer tried the database
+    assert len(gemini.spool_read(ingredients.spool_path(cfg))) == len(client.calls) == 3
+
+
+def test_save_connection_gets_a_short_busy_timeout(db):
+    ingredients.make_save(db.conn)
+    assert db.conn.execute("PRAGMA busy_timeout").fetchone()[0] == ingredients.SAVE_BUSY_TIMEOUT_MS

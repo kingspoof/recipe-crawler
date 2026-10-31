@@ -106,7 +106,13 @@ def todo_lines(conn: sqlite3.Connection) -> list[Line]:
         f"SELECT id, {text} FROM ingredient_lines WHERE status = 0 ORDER BY n DESC")]
 
 
+SAVE_BUSY_TIMEOUT_MS = 10_000  # per save try (3 tries): a stop must not wait minutes for a locked database
+
+
 def make_save(conn: sqlite3.Connection):
+    """The `process` connection only saves answers, so its busy timeout is shortened here."""
+    conn.execute(f"PRAGMA busy_timeout = {SAVE_BUSY_TIMEOUT_MS}")
+
     def save(answered: list[tuple[int, list]], failed: list[int], model: str, gave_up: list[int] = ()) -> None:  # type: ignore[assignment]
         now = time.time()
         with _tx(conn):
