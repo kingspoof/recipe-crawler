@@ -29,6 +29,14 @@ stagger = 5                # seconds between the first request of each lane
 usage_log = "data.nosync/gemini_usage.jsonl"
 keys_file = "gemini_keys.txt"  # one key per line, ONE KEY PER PROJECT (keys of a project share the quota)
 
+[scout]
+# Site discovery (`recipe-crawler scout`). It only proposes config lines; it never enables a site.
+collect_links = true       # during `crawl`: count external domains linked from crawled pages (no extra requests)
+min_linked_sites = 2       # `scout --from-links` keeps domains linked from at least this many crawled sites
+samples = 4                # random pages tested per candidate
+parallel = 4               # candidates probed at the same time
+reprobe_after_days = 28    # failed candidates (blocked, unreachable, ...) are probed again after this long
+
 # ---------------------------------------------------------------------------------------------
 # Seed sites. Every site below was tested with `recipe-crawler probe` on 2026-10-28 and returned
 # schema.org recipes. `country` = cuisine the site mainly covers (ISO code), `region` = for balancing.
@@ -42,36 +50,8 @@ keys_file = "gemini_keys.txt"  # one key per line, ONE KEY PER PROJECT (keys of 
 #   start_urls      = ["https://..."]   where follow_links mode starts (default: homepage)
 #   delay, max_recipes, enabled
 #
-# Excluded after probing (blocked bots with 402/403, no JSON-LD, or disallowed in robots.txt):
-#   allrecipes.com, seriouseats.com, justonecookbook.com, tarladalal.com, ah.nl, chinasichuanfood.com,
-#   taste.com.au, 196flavors.com, cucchiaio.it, przepisy.pl, maangchi.com, masakapahariini.com,
-#   atyabtabkha.com, food24.com, kiwilimon.com (client-side rendered), yemek.com (no sitemap),
-#   sarashpazpapion.com, oktayustam.com, meishij.net, xiangha.com, haemukja.com, sanjeevkapoor.com, masala.tv,
-#   foody.co.il, smulweb.nl, deliciousmagazine.co.uk, bestrecipes.com.au, rotinrice.com, recettes.qc.ca.
-# Excluded for bad structured data (placeholder or incomplete ingredients): nishamadhulika.com,
-#   ranveerbrar.com, christinesrecipes.com, trinesmatblogg.no, 24kitchen.pt, kfoods.com, kuchynalidla.sk,
-#   24kitchen.rs, chelsea.co.nz, recettes-haitiennes.com, cocinafacil.com.mx.
-# Gap-filling round (2026-10-28, candidates from Web Data Commons Recipe domain stats), also excluded:
-#   403 to bots: toriavey.com, silkroadrecipes.com, odlums.ie, canadianliving.com, choumicha.com.
-#   Unreachable from here (connection timeout / DNS; may be geo-blocked, retry from another network):
-#   nami-nami.ee, povar.ru, imaot.co.il, bishulim.co.il, 10dakot.co.il, gotovim.uz, redmag.ir, goyda.ir,
-#   turmericsaffron.com, mypersiankitchen.com, nawalnasrallah.com, myresipi.com, yummy.co.id, recetasboricuas.com.
-#   No Recipe JSON-LD: kaluhiskitchen.com, zimbokitchen.com, xawaash.com, sisijemimah.com, 9jafoodie.com,
-#   noobcook.com, themeatmen.sg, rasa.my, caribbeanpot.com, laylita.com, boliviabella.com, georgianrecipes.net,
-#   chefindisguise.com, bongeats.com, zira.uz, burmesefoodlovers.com, krua.co, thehongkongcookery.com.
-#   Disallowed in robots.txt: arabtabkh.com.
-# Africa / South Asia / Southeast Asia round (2026-10-28), also excluded:
-#   Unreachable from here: afrikcuisine.com, angkorcooking.com, bengalirecipes.com, cookingnepali.com, dooneyskitchen.com,
-#   endeus.tv, flavorsofpakistan.com, indiantamilrecipe.com, jikonimagic.com, lamauricienne.mu, lancewood.co.za,
-#   lifegetsbetter.ph, meemalee.com, nanaabaskitchen.com, nepalifood.blog, pickyeaterblog.com, pikapika.co.ke,
-#   pinoycookingrecipes.com, resepi.app, resepichenom.com, resepkekinian.com, rhodesquality.com, sajiansedap.grid.id,
-#   sarahgraham.co.za, sedaap.biz.id, srilankanrecipes.com, templeofthai.com, urduchef.com, yummy.ph, maggi.ci.
-#   No usable URLs or no Recipe JSON-LD: allnigerianrecipes.com, nigerianfoodtv.com, africanfoodies.com, zeeliciousfoods.com,
-#   immaculatebites.com, recettesafricaine.com, marcussamuelsson.com, thesouthafrican.com, rooirose.co.za, pakistanichefrecipes.com,
-#   sooperchef.pk, cookingwithshaheen.com, ishitaunblogged.com, bongcravings.com, sinfulcurry.com, shesimmers.com, seasaltwithfood.com,
-#   healthythairecipes.com, helenrecipes.com, importfood.com, whattocooktoday.com, riverten.com, lutongbahayrecipe.com,
-#   rinaresep.com, ragam-resep.com, kreasimasakan.com, cooky.vn, bepnhamo.vn, amthuc10phut.vn, burmesebites.com.
-#   403 to bots: currytrail.in.
+# Sites rejected after probing are in [excluded] at the end of this file: `scout` skips them.
+# status: blocked (403/402 to bots or disallowed in robots.txt) | unreachable | no_recipes | bad_data | unknown
 # ---------------------------------------------------------------------------------------------
 
 [seeds]
@@ -353,4 +333,151 @@ site = [
   # ---- Cookpad: millions of home-cook recipes; limited to the countries the dataset lacks.
   # Non-commercial research use only. Country = URL prefix (/id/ /vn/ /th/ /my/ /bd/ /eg/ /sa/).
   { domain = "cookpad.com", country = "", language = "", region = "Global", follow_links = true, url_pattern = "^https://cookpad\\.com/(id/resep|vn/cong-thuc|th/recipes|my/recipes|bd/recipes|eg/%D9%88%D8%B5%D9%81%D8%A7%D8%AA|sa/%D9%88%D8%B5%D9%81%D8%A7%D8%AA)/\\d+$", follow_pattern = "^https://cookpad\\.com/(id/cari|vn/tim-kiem|th/search|my/search|bd/search|eg/search|sa/search)/", start_urls = ["https://cookpad.com/id/cari/ayam", "https://cookpad.com/vn/tim-kiem/g%C3%A0", "https://cookpad.com/th/search/%E0%B9%84%E0%B8%81%E0%B9%88", "https://cookpad.com/my/search/ayam", "https://cookpad.com/bd/search/chicken", "https://cookpad.com/eg/search/%D9%81%D8%B1%D8%A7%D8%AE", "https://cookpad.com/sa/search/%D8%AF%D8%AC%D8%A7%D8%AC", "https://cookpad.com/id/cari/ikan", "https://cookpad.com/vn/tim-kiem/c%C3%A1", "https://cookpad.com/th/search/%E0%B8%AB%E0%B8%A1%E0%B8%B9", "https://cookpad.com/my/search/ikan", "https://cookpad.com/bd/search/fish", "https://cookpad.com/eg/search/%D9%84%D8%AD%D9%85%D8%A9", "https://cookpad.com/sa/search/%D9%83%D8%A8%D8%B3%D8%A9", "https://cookpad.com/id/cari/tempe", "https://cookpad.com/vn/tim-kiem/th%E1%BB%8Bt%20b%C3%B2", "https://cookpad.com/th/search/%E0%B8%9B%E0%B8%A5%E0%B8%B2", "https://cookpad.com/my/search/nasi%20lemak", "https://cookpad.com/bd/search/dal", "https://cookpad.com/eg/search/%D8%B1%D8%B2", "https://cookpad.com/sa/search/%D9%84%D8%AD%D9%85", "https://cookpad.com/id/cari/tahu", "https://cookpad.com/vn/tim-kiem/canh", "https://cookpad.com/th/search/%E0%B8%95%E0%B9%89%E0%B8%A1%E0%B8%A2%E0%B8%B3", "https://cookpad.com/my/search/sambal", "https://cookpad.com/bd/search/bhuna", "https://cookpad.com/eg/search/%D9%85%D9%84%D9%88%D8%AE%D9%8A%D8%A9", "https://cookpad.com/sa/search/%D8%B1%D8%B2", "https://cookpad.com/id/cari/sambal", "https://cookpad.com/vn/tim-kiem/ph%E1%BB%9F", "https://cookpad.com/th/search/%E0%B9%81%E0%B8%81%E0%B8%87", "https://cookpad.com/my/search/kuih", "https://cookpad.com/bd/search/bhorta", "https://cookpad.com/eg/search/%D9%83%D8%B4%D8%B1%D9%8A", "https://cookpad.com/id/cari/sayur", "https://cookpad.com/vn/tim-kiem/%C4%91%E1%BA%ADu%20ph%E1%BB%A5", "https://cookpad.com/th/search/%E0%B8%9C%E0%B8%B1%E0%B8%94", "https://cookpad.com/id/cari/daging%20sapi", "https://cookpad.com/id/cari/nasi%20goreng"], max_recipes = 140000, delay = 0.25},
+]
+
+
+# ---------------------------------------------------------------------------------------------
+# Rejected sites (machine-readable, read by `scout`; the crawler ignores this list).
+# `scout --report` prints new lines for this list from failed probes.
+[excluded]
+site = [
+  { domain = "allrecipes.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "seriouseats.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "justonecookbook.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "tarladalal.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "ah.nl", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "chinasichuanfood.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "taste.com.au", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "196flavors.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "cucchiaio.it", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "przepisy.pl", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "maangchi.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "masakapahariini.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "atyabtabkha.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "food24.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "sarashpazpapion.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "oktayustam.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "meishij.net", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "xiangha.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "haemukja.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "sanjeevkapoor.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "masala.tv", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "foody.co.il", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "smulweb.nl", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "deliciousmagazine.co.uk", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "bestrecipes.com.au", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "rotinrice.com", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "recettes.qc.ca", status = "unknown", note = "402/403 to bots, no JSON-LD or disallowed in robots.txt (not recorded per site)", date = "2026-10-28" },
+  { domain = "kiwilimon.com", status = "no_recipes", note = "client-side rendered", date = "2026-10-28" },
+  { domain = "yemek.com", status = "no_recipes", note = "no sitemap", date = "2026-10-28" },
+  { domain = "nishamadhulika.com", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "ranveerbrar.com", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "christinesrecipes.com", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "trinesmatblogg.no", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "24kitchen.pt", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "kfoods.com", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "kuchynalidla.sk", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "24kitchen.rs", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "chelsea.co.nz", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "recettes-haitiennes.com", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "cocinafacil.com.mx", status = "bad_data", note = "placeholder or incomplete ingredients", date = "2026-10-28" },
+  { domain = "toriavey.com", status = "blocked", note = "403 to bots", date = "2026-10-28" },
+  { domain = "silkroadrecipes.com", status = "blocked", note = "403 to bots", date = "2026-10-28" },
+  { domain = "odlums.ie", status = "blocked", note = "403 to bots", date = "2026-10-28" },
+  { domain = "canadianliving.com", status = "blocked", note = "403 to bots", date = "2026-10-28" },
+  { domain = "choumicha.com", status = "blocked", note = "403 to bots", date = "2026-10-28" },
+  { domain = "nami-nami.ee", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "povar.ru", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "imaot.co.il", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "bishulim.co.il", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "10dakot.co.il", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "gotovim.uz", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "redmag.ir", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "goyda.ir", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "turmericsaffron.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "mypersiankitchen.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "nawalnasrallah.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "myresipi.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "yummy.co.id", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "recetasboricuas.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "kaluhiskitchen.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "zimbokitchen.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "xawaash.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "sisijemimah.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "9jafoodie.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "noobcook.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "themeatmen.sg", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "rasa.my", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "caribbeanpot.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "laylita.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "boliviabella.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "georgianrecipes.net", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "chefindisguise.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "bongeats.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "zira.uz", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "burmesefoodlovers.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "krua.co", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "thehongkongcookery.com", status = "no_recipes", note = "no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "arabtabkh.com", status = "blocked", note = "disallowed in robots.txt", date = "2026-10-28" },
+  { domain = "afrikcuisine.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "angkorcooking.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "bengalirecipes.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "cookingnepali.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "dooneyskitchen.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "endeus.tv", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "flavorsofpakistan.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "indiantamilrecipe.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "jikonimagic.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "lamauricienne.mu", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "lancewood.co.za", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "lifegetsbetter.ph", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "meemalee.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "nanaabaskitchen.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "nepalifood.blog", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "pickyeaterblog.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "pikapika.co.ke", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "pinoycookingrecipes.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "resepi.app", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "resepichenom.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "resepkekinian.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "rhodesquality.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "sajiansedap.grid.id", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "sarahgraham.co.za", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "sedaap.biz.id", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "srilankanrecipes.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "templeofthai.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "urduchef.com", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "yummy.ph", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "maggi.ci", status = "unreachable", note = "connection timeout / DNS; may be geo-blocked, retry from another network", date = "2026-10-28" },
+  { domain = "allnigerianrecipes.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "nigerianfoodtv.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "africanfoodies.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "zeeliciousfoods.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "immaculatebites.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "recettesafricaine.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "marcussamuelsson.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "thesouthafrican.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "rooirose.co.za", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "pakistanichefrecipes.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "sooperchef.pk", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "cookingwithshaheen.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "ishitaunblogged.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "bongcravings.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "sinfulcurry.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "shesimmers.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "seasaltwithfood.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "healthythairecipes.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "helenrecipes.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "importfood.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "whattocooktoday.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "riverten.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "lutongbahayrecipe.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "rinaresep.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "ragam-resep.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "kreasimasakan.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "cooky.vn", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "bepnhamo.vn", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "amthuc10phut.vn", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "burmesebites.com", status = "no_recipes", note = "no usable URLs or no Recipe JSON-LD", date = "2026-10-28" },
+  { domain = "currytrail.in", status = "blocked", note = "403 to bots", date = "2026-10-28" },
 ]

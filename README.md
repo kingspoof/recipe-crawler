@@ -91,11 +91,33 @@ The probe reports whether robots.txt allows crawling, which sitemaps it found, a
 contain recipes. If it reports `discovery: links`, add the site with `follow_links = true` and a `url_pattern`
 matching the recipe URLs it printed. See the comments at the top of `config.toml` for all options.
 
+## Finding new sites (`scout`)
+
+`scout` finds candidate sites, probes them and **proposes** config lines. It never enables a site.
+
+```bash
+uv run recipe-crawler scout --from-links          # external domains linked from >= 2 crawled sites
+uv run recipe-crawler scout --import-wdc FILE     # a downloaded Web Data Commons Recipe domain list (.csv/.tsv/.gz)
+uv run recipe-crawler scout --probe 20            # probe at most 20 candidates (gaps and popular ones first)
+uv run recipe-crawler scout --report              # config.toml lines for the good ones, [excluded] lines for the bad
+```
+
+- **Links**: during `crawl`, the hosts of external links on every fetched page are counted (in memory, written
+  in batches, no extra requests) in `candidate_links`. Turn off with `scout.collect_links = false`.
+- **Filtering**: configured sites, `[excluded]` in `config.toml`, and social/CDN/shop/tracker domains are skipped.
+- **Probing**: the same checks as `probe`, with `scout.samples` pages per site and `scout.parallel` sites at a
+  time. Result per candidate in `site_candidates`: `ok` / `links` / `blocked` / `no_recipes` / `unreachable` /
+  `bad_data` (0–1 or placeholder ingredient lines), hit rate, estimated URLs, language. Failed candidates are
+  probed again after `scout.reprobe_after_days`.
+- **Report**: sorted by expected recipes x gap (languages with few recipes, regions below
+  `max_recipes_per_region`). Country and region are guesses (from the TLD or language) and say so. Review the
+  terms of use and a few recipes before you paste a line into `[seeds]`; paste rejected ones into `[excluded]`.
+
 ## Be a good citizen (and keep your project safe)
 
 - Put a real contact address in `config.toml`. Site operators can then email you instead of banning you.
 - Don't lower `default_delay` below ~1 s, and don't try to get around sites that block bots (403/402,
-  Cloudflare challenges). Several big sites were excluded for exactly that reason (see `config.toml`).
+  Cloudflare challenges). Several big sites were excluded for exactly that reason (`[excluded]` in `config.toml`).
 - Check each site's terms of use. Recipe *ingredient lists* generally aren't copyrightable, but descriptions,
   instructions and photos usually are. Using the data for research is normally fine. **Publishing the
   dataset** is a different question; ask your supervisor or university's legal office before you do.

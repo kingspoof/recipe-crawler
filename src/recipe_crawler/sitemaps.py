@@ -121,10 +121,12 @@ def keep_page_url(site: Site, url: str) -> bool:
 
 
 async def iter_sitemaps(site: Site, roots: list[str], fetch: Fetch,
-                        max_sitemaps: int = MAX_SITEMAPS_PER_SITE) -> AsyncIterator[tuple[str, list[str]]]:
+                        max_sitemaps: int = MAX_SITEMAPS_PER_SITE,
+                        stats: dict | None = None) -> AsyncIterator[tuple[str, list[str]]]:
     """Depth-first walk over sitemap indexes, yielding (sitemap_url, kept_page_urls) per urlset.
 
     Depth-first so that the first page URLs arrive after a few requests, not after reading every index.
+    stats: if given, gets "unread" = sitemaps still queued when max_sitemaps stopped the walk.
     """
     queue = deque(roots)
     seen: set[str] = set()
@@ -144,6 +146,8 @@ async def iter_sitemaps(site: Site, roots: list[str], fetch: Fetch,
         if urls:
             yield sm, [u for u in urls if keep_page_url(site, u)]
         del resp
+    if stats is not None:
+        stats["unread"] = len(set(queue) - seen)
 
 
 def keep_followed_link(site: Site, url: str) -> bool:

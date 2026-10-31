@@ -62,6 +62,36 @@ CREATE TABLE IF NOT EXISTS recipes (
     crawled_at     REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS recipes_domain ON recipes(domain);
+
+-- Site discovery (`scout`). Additive: new tables only, nothing existing changes.
+-- External hosts linked from crawled pages, counted once per page (written in batches during `crawl`).
+CREATE TABLE IF NOT EXISTS candidate_links (
+    host        TEXT NOT NULL,     -- as seen in the link, lowercase
+    from_domain TEXT NOT NULL,     -- the configured site whose page linked to it
+    pages       INTEGER NOT NULL,  -- pages of from_domain that link to host
+    first_seen  REAL,
+    last_seen   REAL,
+    PRIMARY KEY (host, from_domain)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS site_candidates (
+    domain       TEXT PRIMARY KEY,  -- host without "www."
+    host         TEXT NOT NULL,     -- host to probe (and to put in config.toml)
+    source       TEXT NOT NULL,     -- comma-separated: links, wdc
+    seen_count   INTEGER NOT NULL DEFAULT 0,  -- crawled pages linking to it
+    linked_sites INTEGER NOT NULL DEFAULT 0,  -- distinct crawled sites linking to it
+    wdc_entities INTEGER,                     -- Recipe entities in Web Data Commons
+    -- new | ok | links | blocked | no_recipes | unreachable | bad_data
+    status       TEXT NOT NULL DEFAULT 'new',
+    hit_rate     REAL,
+    est_urls     INTEGER,
+    language     TEXT,
+    mode         TEXT,              -- sitemaps | links
+    url_pattern  TEXT,              -- suggested, from the sample pages with recipes
+    probed_at    REAL,
+    notes        TEXT,
+    added_at     REAL NOT NULL
+);
 """
 
 _JSON_FIELDS = ("ingredients", "instructions", "cuisine", "category", "keywords", "nutrition")

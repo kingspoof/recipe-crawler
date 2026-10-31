@@ -55,6 +55,30 @@ class IngredientSettings:
     keys_file: Path = Path("gemini_keys.txt")  # one key per line, one key per Google Cloud project
 
 
+EXCLUDED_STATUSES = ("blocked", "unreachable", "no_recipes", "bad_data", "unknown")
+
+
+@dataclass
+class Excluded:
+    """A site rejected after probing ([excluded] in config.toml). `scout` skips it; the crawler ignores it."""
+
+    domain: str
+    status: str  # one of EXCLUDED_STATUSES
+    note: str = ""
+    date: str = ""
+
+
+@dataclass
+class ScoutSettings:
+    """Site discovery ([scout] in config.toml)."""
+
+    collect_links: bool = True  # count external domains linked from crawled pages (no extra requests)
+    min_linked_sites: int = 2  # `--from-links` keeps domains linked from at least this many crawled sites
+    samples: int = 4  # random pages tested per candidate
+    parallel: int = 4  # candidates probed at the same time
+    reprobe_after_days: int = 28  # failed candidates are probed again after this long
+
+
 @dataclass
 class Settings:
     user_agent: str
@@ -69,6 +93,8 @@ class Settings:
     max_attempts: int = 3
     sites: list[Site] = field(default_factory=list)
     ingredients: IngredientSettings = field(default_factory=IngredientSettings)
+    excluded: list[Excluded] = field(default_factory=list)
+    scout: ScoutSettings = field(default_factory=ScoutSettings)
 
     def site(self, domain: str) -> Site:
         for s in self.sites:
@@ -97,6 +123,34 @@ def _ingredients(data: dict, base: Path) -> IngredientSettings:
         usage_log=base / data.get("usage_log", d.usage_log),
         keys_file=base / data.get("keys_file", d.keys_file),
     )
+
+
+def _scout(data: dict) -> ScoutSettings:
+    d = ScoutSettings()
+    return ScoutSettings(
+        collect_links=bool(data.get("collect_links", d.collect_links)),
+        min_linked_sites=int(data.get("min_linked_sites", d.min_linked_sites)),
+        samples=int(data.get("samples", d.samples)),
+        parallel=int(data.get("parallel", d.parallel)),
+        reprobe_after_days=int(data.get("reprobe_after_days", d.reprobe_after_days)),
+    )
+
+
+def _excluded(entries: list[dict], configured: set[str]) -> list[Excluded]:
+    out, seen = [], set()
+    for e in entries:
+        domain = e["domain"].strip().lower()
+        bare = domain.removeprefix("www.")
+        status = e.get("status", "unknown")
+        if status not in EXCLUDED_STATUSES:
+            raise SystemExit(f"[excluded] {domain}: status must be one of {', '.join(EXCLUDED_STATUSES)}")
+        if bare in seen:
+            raise SystemExit(f"Duplicate site in [excluded]: {domain}")
+        if bare in configured:
+            raise SystemExit(f"{domain} is both a seed site and in [excluded]: remove it from one of them")
+        seen.add(bare)
+        out.append(Excluded(domain, status, e.get("note", ""), str(e.get("date", ""))))
+    return out
 
 
 def load_config(path: str | Path = "config.toml", require_contact: bool = True) -> Settings:
@@ -148,4 +202,6 @@ def load_config(path: str | Path = "config.toml", require_contact: bool = True) 
         max_attempts=int(c.get("max_attempts", 3)),
         sites=sites,
         ingredients=_ingredients(data.get("ingredients", {}), path.parent),
+        excluded=_excluded(data.get("excluded", {}).get("site", []), {s.domain.removeprefix("www.") for s in sites}),
+        scout=_scout(data.get("scout", {})),
     )

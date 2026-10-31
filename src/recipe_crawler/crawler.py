@@ -14,6 +14,7 @@ from .config import Settings, Site
 from .db import DB
 from .extract import extract_links, extract_recipes
 from .net import MAX_SITEMAP_BYTES, Fetcher, Response, Robots, Throttle, TooLarge, fetch_robots
+from .scout import LinkCollector, external_hosts
 from .sitemaps import FALLBACK_SITEMAPS, iter_sitemaps, select_sitemaps, keep_followed_link, keep_page_url
 
 log = logging.getLogger("crawler")
@@ -31,6 +32,7 @@ class DomainWorker:
         self.c = crawler
         self.site = site
         self.robots: Robots | None = None
+        self.setup_problem: str | None = None  # why setup() skipped the domain
         self.throttle = Throttle(site.delay or crawler.settings.default_delay)
         self.consecutive_failures = 0
         self.pages = 0
@@ -64,6 +66,7 @@ class DomainWorker:
         self.robots, problem = await fetch_robots(self.c.fetcher, self.site.base_url)
         self.throttle.done()
         if problem:
+            self.setup_problem = problem
             self.log.warning("skipping domain: %s", problem)
             return False
         if self.robots.crawl_delay:
@@ -163,6 +166,11 @@ class DomainWorker:
             self.db.mark(url, "no_recipe", r.status, f"content-type {r.content_type}")
             return
         page = r.text()
+        if self.c.links is not None:
+            try:
+                self.c.links.add(self.site.domain, await asyncio.to_thread(external_hosts, page, self.site.domain))
+            except Exception:  # candidate links are a side product: never let them stop the crawl
+                self.log.debug("collecting candidate links failed on %s", url, exc_info=True)
         if self.site.follow_links:
             links = await asyncio.to_thread(extract_links, page, r.url)
             self.db.add_urls(self.site.domain, (
@@ -206,6 +214,8 @@ class Crawler:
         self.total = db.recipe_count()
         self.region_total: defaultdict[str, int] = defaultdict(int, db.region_counts())
         self.workers: list[DomainWorker] = []
+        # External domains seen on crawled pages, for `scout --from-links`.
+        self.links: LinkCollector | None = LinkCollector(db, settings) if settings.scout.collect_links else None
 
     def region_full(self, region: str) -> bool:
         cap = self.settings.max_recipes_per_region
@@ -240,4 +250,6 @@ class Crawler:
             await asyncio.gather(*(guarded(w) for w in self.workers))
         finally:
             reporter.cancel()
+            if self.links is not None:
+                self.links.flush()
             await self.fetcher.aclose()
