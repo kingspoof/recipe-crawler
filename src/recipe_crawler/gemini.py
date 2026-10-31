@@ -341,6 +341,30 @@ class Line:
 
 # save(answered [(line id, items)], failed [line id], model)
 SaveFn = Callable[[list[tuple[int, list]], list[int], str], None]
+SAVE_TRIES = 3
+
+
+def spool_write(path: Path, answered: list[tuple[int, list]], failed: list[int], model: str) -> None:
+    """Answers that could not be saved to the database (locked, disk full, ...): applied on the next run."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps({"answered": answered, "failed": failed, "model": model}, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def spool_read(path: Path) -> list[tuple[list[tuple[int, list]], list[int], str]]:
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:  # half-written line after a hard abort
+                    continue
+                out.append(([(id, items) for id, items in rec["answered"]], rec["failed"], rec["model"]))
+    except FileNotFoundError:
+        pass
+    return out
 
 
 class Processor:
@@ -349,8 +373,9 @@ class Processor:
     def __init__(self, cfg: IngredientSettings, lanes: list[Lane], usage: UsageLog, save: SaveFn,
                  max_requests: int | None = None, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], Any] | None = None, retry_sleep: Callable[[float], Any] = time.sleep,
-                 retry_wait: float = RETRY_WAIT):
-        self.cfg, self.lanes, self.usage, self.save = cfg, lanes, usage, save
+                 retry_wait: float = RETRY_WAIT, spool: Path | None = None):
+        self.cfg, self.lanes, self.usage, self._save_fn = cfg, lanes, usage, save
+        self.spool = spool  # where answers go when the database cannot take them
         self.max_requests = max_requests
         self.clock = clock
         self._stop = threading.Event()
@@ -358,6 +383,27 @@ class Processor:
         self.retry_sleep, self.retry_wait = retry_sleep, retry_wait
         self.sent = self.done = self.failed = 0
         self.tokens: Counter[str] = Counter()
+        self.error: BaseException | None = None  # a bug in a worker thread: raised after the requests in flight
+
+    def save(self, answered: list[tuple[int, list]], failed: list[int], model: str) -> None:
+        """Saves with retries. If the database still fails, the answers go to the spool file and sending stops,
+        so the requests in flight (paid with quota) are not lost."""
+        for attempt in range(SAVE_TRIES):
+            try:
+                self._save_fn(answered, failed, model)
+                return
+            except Exception as e:  # sqlite3.OperationalError (locked, disk full, ...)
+                log.warning("saving %d answers failed (%s), try %d/%d", len(answered), e, attempt + 1, SAVE_TRIES)
+                if attempt + 1 < SAVE_TRIES:
+                    self.retry_sleep(2 ** attempt)
+                    continue
+                if self.spool is None:
+                    raise
+                spool_write(self.spool, answered, failed, model)
+                if not self.stopping:
+                    log.error("database not writable: answers go to %s (applied by the next `process`); "
+                              "no new requests", self.spool)
+                self.stop()
 
     def stop(self) -> None:
         """Stop sending; requests in flight are still waited for and saved."""
@@ -420,8 +466,11 @@ class Processor:
                         break
                 # Until the next lane may send again (rate limit or 429 pause), but at most 30 s.
                 # Lanes at the in-flight limit wake up through a finished request, not through the clock.
+                # Nothing more to send (end of the run, stop): only the requests in flight, no busy polling.
                 wake = min((max(lane.next_at, lane.paused_until) for lane in self.lanes
                             if not lane.exhausted and lane.in_flight < cfg.in_flight), default=now + 30) - now
+                if not may_send():
+                    wake = 2.0
                 if not futures:  # nothing in flight: every lane is waiting
                     if wake > 60:
                         log.info("all lanes paused, sleeping %.0f min", wake / 60)
@@ -429,15 +478,24 @@ class Processor:
                     continue
                 finished, _ = wait(futures, timeout=min(max(wake, 0.01), 2), return_when=FIRST_COMPLETED)
                 for future in finished:
-                    self._finished(*futures.pop(future), future.result(), retry, started, total, len(todo))
+                    lane, batch = futures.pop(future)
+                    lane.in_flight -= 1
+                    try:
+                        self._finished(lane, batch, future.result(), retry, started, total, len(todo))
+                    except Exception as e:  # a bug: stop sending, but wait for and save what is in flight
+                        log.exception("%s: request failed with an unexpected error, stopping", lane.name)
+                        retry.extendleft(reversed(batch))
+                        self.error = self.error or e
+                        self.stop()
         log.info("finished (%s): %s done, %d failed, %d requests, tokens %s", reason, f"{self.done:,}",
                  self.failed, self.sent, dict(self.tokens))
+        if self.error is not None:
+            raise self.error
         return reason
 
     def _finished(self, lane: Lane, batch: list[Line], outcome: tuple[Any, dict], retry: deque[Line],
                   started: float, total: int, todo_left: int) -> None:
         result, rec = outcome
-        lane.in_flight -= 1
         error = rec.get("error", "")
         lane.used += rec.get("retries", 0)  # every retry inside call() was a request too
         if error.startswith("429"):

@@ -455,3 +455,48 @@ def test_truncated_answer_keeps_complete_objects(db, cfg):
 def test_salvage():
     assert gemini.salvage('[{"i": 0}, {"i": 1}, {"i"') == [{"i": 0}, {"i": 1}]
     assert gemini.salvage("[") == [] and gemini.salvage("oops") == []
+
+
+def test_unwritable_database_spools_answers_and_stops(db, cfg):
+    """Regression: an error in save() crashed the loop and lost every request in flight."""
+    cfg.batch_size = 1
+    add_lines(db.conn, "a", "b", "c")
+    calls = []
+
+    def save(answered, failed, model):
+        calls.append(len(answered))
+        raise sqlite3.OperationalError("database or disk is full")
+
+    clock = FakeClock()
+    usage = UsageLog(cfg.usage_log)
+    client = FakeClient()
+    p = Processor(cfg, [Lane("k1", client, "m", 0, cfg.rpd)], usage, save, clock=clock, sleep=clock.sleep,
+                  retry_sleep=lambda s: None, spool=ingredients.spool_path(cfg))
+    assert p.run(ingredients.todo_lines(db.conn)) == "stopped"
+    assert len(calls) == gemini.SAVE_TRIES and len(client.calls) == 1  # retried, then no new requests
+    assert set(statuses(db.conn).values()) == {0}
+
+    assert ingredients.apply_spool(db.conn, cfg) == 1  # the next `process` saves them first
+    assert statuses(db.conn)["a"] == 1 and not ingredients.spool_path(cfg).exists()
+    assert ingredients.apply_spool(db.conn, cfg) == 0
+
+
+def test_bug_in_finished_waits_for_in_flight_then_raises(db, cfg, monkeypatch):
+    cfg.in_flight = 2
+    add_lines(db.conn, "a", "b", "c", "d")
+    client = FakeClient(lambda n, lines: time.sleep(0.1) or None)  # both requests in flight at the same time
+    p = Processor(cfg, [Lane("k1", client, "m", 0, cfg.rpd)], UsageLog(cfg.usage_log),
+                  ingredients.make_save(db.conn))  # real clock: rpm 6000 = 10 ms between requests
+    real = p._finished
+    n = []
+
+    def finished(*a):
+        n.append(1)
+        if len(n) == 1:
+            raise KeyError("bug")
+        return real(*a)
+
+    monkeypatch.setattr(p, "_finished", finished)
+    with pytest.raises(KeyError):
+        p.run(ingredients.todo_lines(db.conn))
+    assert len(client.calls) == 2 and list(statuses(db.conn).values()).count(1) == 2  # the other one was saved

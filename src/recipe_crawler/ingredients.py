@@ -25,7 +25,7 @@ import time
 from collections import Counter
 from .config import IngredientSettings
 from .db import transaction as _tx
-from .gemini import Line, UsageLog, fingerprint, next_reset, quota_day
+from .gemini import Line, UsageLog, fingerprint, next_reset, quota_day, spool_read
 
 log = logging.getLogger("ingredients")
 
@@ -157,6 +157,25 @@ def make_save(conn: sqlite3.Connection):
             )
             conn.executemany("UPDATE ingredient_lines SET status = -1 WHERE id = ?", [(id,) for id in failed])
     return save
+
+
+def spool_path(cfg: IngredientSettings):
+    return cfg.usage_log.parent / "unsaved_answers.jsonl"
+
+
+def apply_spool(conn: sqlite3.Connection, cfg: IngredientSettings) -> int:
+    """Saves the answers a previous `process` could not write to the database, then removes the file."""
+    path = spool_path(cfg)
+    records = spool_read(path)
+    if not records and not path.exists():
+        return 0
+    save = make_save(conn)
+    for answered, failed, model in records:
+        save(answered, failed, model)
+    path.unlink()
+    n = sum(len(a) for a, _, _ in records)
+    log.info("applied %s answers from %s", f"{n:,}", path)
+    return n
 
 
 # --------------------------------------------------------------------------- step 3: map
