@@ -168,3 +168,13 @@ def test_tables_size_without_dbstat(live, tmp_path):
 
     assert with_dbstat > 0 and backup._tables_size(NoDbstat(), ("ingredient_lines",)) > 0
     con.close()
+
+
+def test_tables_size_counts_the_indexes(live, tmp_path):
+    """Review N4: the estimate only counted the table pages."""
+    live.conn.executemany("INSERT INTO ingredient_lines (line, n) VALUES (?, 1)",
+                          [(f"line {i} " + "x" * 50,) for i in range(2000)])
+    con = sqlite3.connect(tmp_path / "data" / "r.db")
+    table_only = con.execute("SELECT SUM(pgsize) FROM dbstat WHERE name = 'ingredient_lines'").fetchone()[0]
+    assert backup._tables_size(con, ("ingredient_lines",)) > 1.5 * table_only  # + UNIQUE(line) + the todo index
+    con.close()

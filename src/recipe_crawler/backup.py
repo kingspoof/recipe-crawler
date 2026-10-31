@@ -70,13 +70,15 @@ def _free_space_check(directory: Path, needed: int) -> None:
 
 
 def _tables_size(con: sqlite3.Connection, tables: tuple[str, ...]) -> int:
-    """Bytes the tables take: from dbstat if SQLite has it, else summed up from the column values."""
+    """Bytes the tables and their indexes take: from dbstat if SQLite has it, else summed up from the column
+    values (doubled for the indexes)."""
     tables = tuple(t for t in tables if has_table(con, t))
     if not tables:
         return 0
-    try:
+    marks = ",".join("?" * len(tables))
+    try:  # every b-tree of these tables: the table itself, its indexes and the automatic ones (UNIQUE, PK)
         return con.execute(f"SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name IN "
-                           f"({','.join('?' * len(tables))})", tables).fetchone()[0]
+                           f"(SELECT name FROM sqlite_master WHERE tbl_name IN ({marks}))", tables).fetchone()[0]
     except sqlite3.OperationalError:  # no dbstat in this SQLite build
         total = 0
         for t in tables:
