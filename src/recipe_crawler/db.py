@@ -20,6 +20,11 @@ from .config import Site
 from .extract import Recipe
 
 
+EXPORT_COLUMNS = (
+    "url, domain, site_country, site_region, language, name, description, ingredients, instructions, cuisine, "
+    "category, keywords, prep_time_min, cook_time_min, total_time_min, recipe_yield, image, author, "
+    "date_published, rating_value, rating_count, nutrition, crawled_at"
+)
 _JSON_FIELDS = ("ingredients", "instructions", "cuisine", "category", "keywords", "nutrition")
 
 # Seconds a connection waits for another one's write lock. `map` and `crawl` run at the same time, and a
@@ -230,9 +235,9 @@ class DB:
         return dict(self.conn.execute("SELECT site_region, COUNT(*) FROM recipes GROUP BY site_region"))
 
     def iter_recipes(self, include_raw: bool = False) -> Iterator[dict[str, Any]]:
-        cols = "*" if include_raw else "url, domain, site_country, site_region, language, name, description, ingredients, " \
-            "instructions, cuisine, category, keywords, prep_time_min, cook_time_min, total_time_min, " \
-            "recipe_yield, image, author, date_published, rating_value, rating_count, nutrition, crawled_at"
+        # Listed, not "*": the real table still has legacy columns from earlier versions, which must not end up
+        # in the export.
+        cols = EXPORT_COLUMNS + (", raw" if include_raw else "")
         for row in self.conn.execute(f"SELECT {cols} FROM recipes ORDER BY id"):
             d = dict(row)
             for f in _JSON_FIELDS + (("raw",) if include_raw else ()):

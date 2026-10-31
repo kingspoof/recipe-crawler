@@ -68,3 +68,15 @@ def test_single_instance(tmp_path):
     single_instance(tmp_path / "r.db", "crawl")  # a different command is fine
     os.close(fd)
     single_instance(tmp_path / "r.db", "process")
+
+
+def test_export_raw_lists_its_columns(tmp_path):
+    db = DB(tmp_path / "r.db")
+    db.conn.execute("ALTER TABLE recipes ADD COLUMN legacy_col TEXT")  # like the real database
+    db.conn.execute("INSERT INTO recipes(url, domain, name, ingredients, instructions, raw, legacy_col, crawled_at) "
+                    "VALUES ('u', 'x', 'n', '[]', '[]', '{\"a\": 1}', 'old', 0)")
+    [rec] = db.iter_recipes(include_raw=True)
+    assert rec["raw"] == {"a": 1} and "legacy_col" not in rec and "id" not in rec
+    [rec] = db.iter_recipes()
+    assert "raw" not in rec
+    db.close()
