@@ -294,3 +294,19 @@ def test_unreachable_redirect_host_is_retried_after_an_hour(tmp_path):
     routes["https://other.test/robots.txt"] = (200, ROBOTS_OK, TEXT)
     now[0] = 3601
     assert not asyncio.run(w.robots_for("https://other.test/a")).unreachable  # not cached for 24 h
+
+
+def test_permanently_failing_sitemap_is_given_up_after_3_runs(tmp_path):
+    """Regression (review S3): one broken child sitemap made every run re-read the whole tree."""
+    from recipe_crawler.crawler import MAX_INCOMPLETE_DISCOVERIES
+
+    xml = {"content-type": "application/xml"}
+    routes = {"https://x.test/robots.txt": (200, ROBOTS_OK + "Sitemap: https://x.test/index.xml\n", TEXT),
+              "https://x.test/index.xml": (200, SITEMAP_INDEX, xml),
+              "https://x.test/sm-1.xml": (200, urlset("https://x.test/r/1"), xml),
+              "https://x.test/sm-2.xml": (500, "", xml)}
+    for run in range(1, MAX_INCOMPLETE_DISCOVERIES + 1):
+        crawler, w, db = make(tmp_path, routes)
+        asyncio.run(w.run(discover_only=True))
+        assert db.is_discovered("x.test") == (run == MAX_INCOMPLETE_DISCOVERIES)
+    assert db.conn.execute("SELECT incomplete_discoveries FROM domains").fetchone()[0] == 0  # reset

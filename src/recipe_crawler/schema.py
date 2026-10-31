@@ -145,6 +145,11 @@ def _has_index_on(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return False
 
 
+def _v2_incomplete_discoveries(conn: sqlite3.Connection) -> None:
+    # schema only (no table rewrite), instant on the real database: no backup needed
+    conn.execute("ALTER TABLE domains ADD COLUMN incomplete_discoveries INTEGER NOT NULL DEFAULT 0")
+
+
 @dataclass(frozen=True)
 class Migration:
     version: int
@@ -155,6 +160,7 @@ class Migration:
 
 MIGRATIONS = [
     Migration(1, "baseline (crawler + ingredient tables, ingredient_lines.original)", _v1_baseline, backup=False),
+    Migration(2, "domains.incomplete_discoveries", _v2_incomplete_discoveries, backup=False),
 ]
 CURRENT = len(MIGRATIONS)
 assert [m.version for m in MIGRATIONS] == list(range(1, CURRENT + 1))

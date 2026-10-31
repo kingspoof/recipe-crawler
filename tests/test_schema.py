@@ -56,37 +56,52 @@ def test_readonly_never_migrates_or_creates(tmp_path):
 
 
 def test_migration_needing_a_backup(tmp_path, monkeypatch):
-    def v2(conn):
+    def add_note(conn):
         conn.execute("ALTER TABLE urls ADD COLUMN note TEXT")
 
-    def v3_broken(conn):
+    def broken(conn):
         conn.execute("ALTER TABLE urls ADD COLUMN other TEXT")
         raise RuntimeError("bug in migration")
 
-    old_db(tmp_path / "r.db", version=1)
-    monkeypatch.setattr(schema, "MIGRATIONS", schema.MIGRATIONS + [schema.Migration(2, "note", v2)])
-    monkeypatch.setattr(schema, "CURRENT", 2)
+    base = schema.CURRENT
+    old_db(tmp_path / "r.db")
+    DB(tmp_path / "r.db").close()  # at the current version
+    monkeypatch.setattr(schema, "MIGRATIONS", schema.MIGRATIONS + [schema.Migration(base + 1, "note", add_note)])
+    monkeypatch.setattr(schema, "CURRENT", base + 1)
     with pytest.raises(SystemExit, match="backup"):
         DB(tmp_path / "r.db")  # no backup configured: refused, nothing changed
     con = sqlite3.connect(tmp_path / "r.db")
-    assert schema.version(con) == 1
+    assert schema.version(con) == base
     con.close()
 
     calls = []
     db = DB(tmp_path / "r.db", backup=lambda: calls.append(1))
-    assert calls == [1] and schema.version(db.conn) == 2 and "note" in schema.columns(db.conn, "urls")
+    assert calls == [1] and schema.version(db.conn) == base + 1 and "note" in schema.columns(db.conn, "urls")
     db.close()
 
-    monkeypatch.setattr(schema, "MIGRATIONS", schema.MIGRATIONS + [schema.Migration(3, "broken", v3_broken)])
-    monkeypatch.setattr(schema, "CURRENT", 3)
+    monkeypatch.setattr(schema, "MIGRATIONS", schema.MIGRATIONS + [schema.Migration(base + 2, "broken", broken)])
+    monkeypatch.setattr(schema, "CURRENT", base + 2)
     with pytest.raises(RuntimeError):
         DB(tmp_path / "r.db", backup=lambda: None)
     con = sqlite3.connect(tmp_path / "r.db")
-    assert schema.version(con) == 2 and "other" not in schema.columns(con, "urls")  # rolled back together
+    assert schema.version(con) == base + 1 and "other" not in schema.columns(con, "urls")  # rolled back together
     con.close()
 
 
 def test_new_empty_database_needs_no_backup(tmp_path):
     db = DB(tmp_path / "new.db")
     assert schema.version(db.conn) == schema.CURRENT
+    db.close()
+
+
+def test_v2_adds_incomplete_discoveries_to_a_v1_database(tmp_path):
+    old_db(tmp_path / "r.db", version=1)  # what this branch's first version left behind
+    con = sqlite3.connect(tmp_path / "r.db")
+    con.execute("INSERT INTO domains(domain, discovered_at) VALUES ('x', 1)")
+    con.commit()
+    con.close()
+    db = DB(tmp_path / "r.db")
+    assert schema.version(db.conn) >= 2
+    assert tuple(db.conn.execute("SELECT domain, discovered_at, incomplete_discoveries FROM domains").fetchone()) == (
+        "x", 1, 0)
     db.close()

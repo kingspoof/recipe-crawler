@@ -31,6 +31,9 @@ ROBOTS_MAX_AGE = 24 * 3600
 # robots.txt unreachable (5xx / network): try again after this long. Meanwhile a previously fetched copy is
 # kept (RFC 9309 2.4: the 24 h limit does not apply while robots.txt is unreachable).
 ROBOTS_RETRY = 3600
+# A discovery with failed sitemaps is repeated at the next start; after this many in a row the domain is marked
+# discovered anyway, so a sitemap that is broken for good does not make every run re-read the whole tree.
+MAX_INCOMPLETE_DISCOVERIES = 3
 MAX_REDIRECTS = 5
 REDIRECTS = (301, 302, 303, 307, 308)
 # After a stop request, workers get this long to finish the request in flight, then they are cancelled
@@ -181,9 +184,14 @@ class DomainWorker:
         if failed:
             # Not marked as discovered, so the next run reads the sitemaps again (the URLs already queued
             # are ignored then). Marking it would hide the missing sitemaps until `discover --force`.
-            self.log.warning("discovery incomplete: %d sitemap(s) failed (e.g. %s), %d sitemaps read, %d URLs "
-                             "queued; retrying next run", len(failed), failed[0], sitemaps_read, urls_found)
-            return
+            n = self.db.discovery_incomplete(self.site.domain)
+            if n < MAX_INCOMPLETE_DISCOVERIES:
+                self.log.warning("discovery incomplete (%d/%d): %d sitemap(s) failed (e.g. %s), %d sitemaps read, "
+                                 "%d URLs queued; retrying next run", n, MAX_INCOMPLETE_DISCOVERIES, len(failed),
+                                 failed[0], sitemaps_read, urls_found)
+                return
+            self.log.warning("discovery incomplete %d times in a row (%d sitemap(s) failed, e.g. %s): marking it "
+                             "discovered anyway", n, len(failed), failed[0])
         self.db.set_discovered(self.site.domain, sitemaps_read, urls_found)
         self.log.info("discovery done: %d sitemaps, %d URLs queued", sitemaps_read, urls_found)
 

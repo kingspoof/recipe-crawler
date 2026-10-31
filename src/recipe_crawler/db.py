@@ -189,9 +189,20 @@ class DB:
         self.conn.execute(
             """INSERT INTO domains(domain, discovered_at, sitemaps_read, urls_found) VALUES (?, ?, ?, ?)
                ON CONFLICT(domain) DO UPDATE SET discovered_at = excluded.discovered_at,
-               sitemaps_read = excluded.sitemaps_read, urls_found = excluded.urls_found""",
+               sitemaps_read = excluded.sitemaps_read, urls_found = excluded.urls_found,
+               incomplete_discoveries = 0""",
             (domain, time.time(), sitemaps_read, urls_found),
         )
+
+    def discovery_incomplete(self, domain: str) -> int:
+        """Counts a discovery run in which some sitemap failed; returns how many in a row (discovered_at stays)."""
+        self.conn.execute(
+            """INSERT INTO domains(domain, incomplete_discoveries) VALUES (?, 1)
+               ON CONFLICT(domain) DO UPDATE SET incomplete_discoveries = incomplete_discoveries + 1""",
+            (domain,),
+        )
+        return self.conn.execute("SELECT incomplete_discoveries FROM domains WHERE domain = ?",
+                                 (domain,)).fetchone()[0]
 
     def reset_discovery(self, domain: str) -> None:
         self.conn.execute("DELETE FROM domains WHERE domain = ?", (domain,))

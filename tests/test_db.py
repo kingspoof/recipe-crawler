@@ -46,14 +46,15 @@ def test_migration_waits_for_no_other_process(tmp_path, monkeypatch):
 
     path = tmp_path / "r.db"
     running = DB(path)  # e.g. a long `crawl`: holds the shared lock
+    new = schema.CURRENT + 1
     monkeypatch.setattr(schema, "MIGRATIONS", schema.MIGRATIONS + [
-        schema.Migration(2, "x", lambda c: c.execute("CREATE TABLE x (a)"), backup=False)])
-    monkeypatch.setattr(schema, "CURRENT", 2)
+        schema.Migration(new, "x", lambda c: c.execute("CREATE TABLE x (a)"), backup=False)])
+    monkeypatch.setattr(schema, "CURRENT", new)
     with pytest.raises(Busy, match="stop it"):
         DB(path)
     running.close()
     db = DB(path)  # now it may migrate
-    assert schema.version(db.conn) == 2
+    assert schema.version(db.conn) == new
     DB(path).close()  # and others can open it next to it (lock downgraded to shared)
     db.close()
 
