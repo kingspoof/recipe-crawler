@@ -71,13 +71,13 @@ class Fetcher:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
             timeout=httpx.Timeout(timeout, connect=15.0),
-            follow_redirects=True,
+            follow_redirects=False,  # DomainWorker follows them itself, checking robots.txt for every hop
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
         )
 
-    async def get(self, url: str, max_bytes: int = MAX_PAGE_BYTES) -> Response:
+    async def get(self, url: str, max_bytes: int = MAX_PAGE_BYTES, follow_redirects: bool = False) -> Response:
         start = time.monotonic()
-        async with self.client.stream("GET", url) as r:
+        async with self.client.stream("GET", url, follow_redirects=follow_redirects) as r:
             declared = r.headers.get("content-length")
             if declared and declared.isdigit() and int(declared) > max_bytes:
                 raise TooLarge(f"{declared} bytes")
@@ -154,7 +154,8 @@ class Robots:
 async def fetch_robots(fetcher: Fetcher, base_url: str) -> tuple[Robots, str | None]:
     """Fetch robots.txt following RFC 9309: 4xx = allow all, 5xx/network error = disallow all."""
     try:
-        r = await fetcher.get(f"{base_url}/robots.txt", max_bytes=2 * 1024 * 1024)
+        # RFC 9309: follow at least five redirects for robots.txt itself
+        r = await fetcher.get(f"{base_url}/robots.txt", max_bytes=2 * 1024 * 1024, follow_redirects=True)
     except (httpx.HTTPError, TooLarge) as e:
         return Robots(None, fetcher.robots_token), f"robots.txt unreachable: {type(e).__name__}: {e}"
     if r.status >= 500 or r.status == 429:

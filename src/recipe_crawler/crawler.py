@@ -7,6 +7,8 @@ import itertools
 import logging
 import time
 from collections import defaultdict
+from typing import Iterable
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -24,13 +26,24 @@ MAX_CONSECUTIVE_FAILURES = 25
 # Stop crawling a domain if, after this many pages, almost none contained a recipe.
 YIELD_CHECK_AFTER = 300
 MIN_RECIPE_YIELD = 0.05
+# RFC 9309: a cached robots.txt should not be used for more than 24 hours. A crawl can run for days.
+ROBOTS_MAX_AGE = 24 * 3600
+MAX_REDIRECTS = 5
+REDIRECTS = (301, 302, 303, 307, 308)
+
+
+def _origin(url: str) -> str:
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}".lower()
 
 
 class DomainWorker:
     def __init__(self, crawler: "Crawler", site: Site):
         self.c = crawler
         self.site = site
-        self.robots: Robots | None = None
+        self.robots: Robots | None = None  # of the site itself, as of the last fetch
+        self._robots: dict[str, tuple[Robots, float]] = {}  # origin -> (robots.txt, fetched at), every host
+        self.clock = time.monotonic
         self.throttle = Throttle(site.delay or crawler.settings.default_delay)
         self.consecutive_failures = 0
         self.pages = 0
@@ -41,8 +54,55 @@ class DomainWorker:
     def db(self) -> DB:
         return self.c.db
 
+    async def robots_for(self, url: str) -> Robots:
+        """robots.txt of the URL's host (www.x and x are different hosts), fetched again after 24 h."""
+        origin = _origin(url)
+        cached = self._robots.get(origin)
+        if cached and self.clock() - cached[1] < ROBOTS_MAX_AGE:
+            return cached[0]
+        await self.throttle.wait()
+        robots, problem = await fetch_robots(self.c.fetcher, origin)
+        self.throttle.done()
+        if problem:
+            self.log.info("%s: %s", origin, problem)
+        self._robots[origin] = (robots, self.clock())
+        if origin == _origin(self.site.base_url):
+            self.robots = robots
+        return robots
+
+    async def allowed(self, url: str) -> bool:
+        return (await self.robots_for(url)).allowed(url)
+
+    async def filter_allowed(self, urls: Iterable[str]) -> list[str]:
+        out = []
+        for u in urls:
+            if await self.allowed(u):  # one robots.txt per host, then cached
+                out.append(u)
+        return out
+
     async def _get(self, url: str, max_bytes: int | None = None) -> Response | None:
-        """Polite GET: waits for the throttle, retries nothing, returns None on network errors."""
+        """Polite GET: waits for the throttle, retries nothing, returns None on network errors.
+
+        Redirects are followed by hand, so that each target is checked against its own host's robots.txt.
+        A redirect that is not followed (disallowed, too many, no Location) is returned as the 3xx response.
+        """
+        for _ in range(MAX_REDIRECTS + 1):
+            r = await self._get_once(url, max_bytes)
+            if r is None or r.status not in REDIRECTS or not r.headers.get("location"):
+                return r
+            target = urljoin(r.url, r.headers["location"])
+            if urlsplit(target).scheme not in ("http", "https"):
+                return r
+            robots = await self.robots_for(target)
+            if robots.unreachable:
+                return None  # temporary, like a network error: retried later
+            if not robots.allowed(target):
+                self.log.debug("not following redirect %s -> %s (robots.txt)", url, target)
+                return r
+            url = target
+        return r
+
+    async def _get_once(self, url: str, max_bytes: int | None = None) -> Response | None:
         await self.throttle.wait()
         try:
             r = await self.c.fetcher.get(url, max_bytes) if max_bytes else await self.c.fetcher.get(url)
@@ -60,11 +120,9 @@ class DomainWorker:
         return r
 
     async def setup(self) -> bool:
-        await self.throttle.wait()
-        self.robots, problem = await fetch_robots(self.c.fetcher, self.site.base_url)
-        self.throttle.done()
-        if problem:
-            self.log.warning("skipping domain: %s", problem)
+        self.robots = await self.robots_for(self.site.base_url)
+        if self.robots.unreachable:
+            self.log.warning("skipping domain: robots.txt unreachable or blocking bots")
             return False
         if self.robots.crawl_delay:
             self.throttle = Throttle(max(self.throttle.base_delay, min(self.robots.crawl_delay, 60)))
@@ -81,13 +139,13 @@ class DomainWorker:
         sitemaps_read = urls_found = 0
         if self.site.follow_links:
             starts = self.site.start_urls or [self.site.base_url + "/"]
-            urls_found += self.db.add_urls(self.site.domain, [u for u in starts if self.robots.allowed(u)])
+            urls_found += self.db.add_urls(self.site.domain, await self.filter_allowed(starts))
         self.log.info("discovering URLs from %d sitemap root(s)", len(roots))
 
         failed: list[str] = []
 
         async def fetch(url: str) -> Response | None:
-            if not self.robots.allowed(url):
+            if not await self.allowed(url):  # a child sitemap can be on another host (a CDN, the bare domain)
                 return None
             r = await self._get(url, MAX_SITEMAP_BYTES)
             if r is None or r.status == 429 or r.status >= 500:  # temporary: try again next run
@@ -96,7 +154,7 @@ class DomainWorker:
 
         async for sm, urls in iter_sitemaps(self.site, roots, fetch):
             sitemaps_read += 1
-            urls = [u for u in urls if self.robots.allowed(u)]
+            urls = await self.filter_allowed(urls)
             added = self.db.add_urls(self.site.domain, urls)
             urls_found += added
             if sitemaps_read % 25 == 0:
@@ -153,7 +211,12 @@ class DomainWorker:
 
     async def _process(self, url: str) -> None:
         s = self.c.settings
-        if not self.robots.allowed(url):
+        robots = await self.robots_for(url)  # fetched again once it is 24 h old
+        if robots.unreachable:  # 5xx / network / bot blocking: not the URL's fault, try again next run
+            self.log.warning("robots.txt of %s is unreachable now, pausing this domain", _origin(url))
+            self.consecutive_failures = MAX_CONSECUTIVE_FAILURES
+            return
+        if not robots.allowed(url):
             self.db.mark(url, "blocked")
             return
         if not self.site.follow_links and not keep_page_url(self.site, url):
@@ -167,6 +230,9 @@ class DomainWorker:
             return
         if r.status in (429, 503):
             return  # leave it pending; the throttle already backed off
+        if r.status in REDIRECTS:
+            self.db.mark(url, "blocked", r.status, f"redirect not followed: {r.headers.get('location', '')}"[:300])
+            return
         if r.status in (404, 410):
             self.db.mark(url, "gone", r.status)
             self.consecutive_failures = 0
@@ -183,8 +249,8 @@ class DomainWorker:
         page = r.text()
         if self.site.follow_links:
             links = await asyncio.to_thread(extract_links, page, r.url)
-            self.db.add_urls(self.site.domain, (
-                u for u in links if keep_followed_link(self.site, u) and self.robots.allowed(u)))
+            self.db.add_urls(self.site.domain, await self.filter_allowed(
+                u for u in links if keep_followed_link(self.site, u)))
         recipes = await asyncio.to_thread(extract_recipes, page, url)
         if not recipes:
             self.db.mark(url, "no_recipe", r.status)

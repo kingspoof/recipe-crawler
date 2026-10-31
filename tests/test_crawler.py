@@ -127,3 +127,63 @@ def test_rediscover_after_days(tmp_path):
     db.conn.execute("UPDATE domains SET discovered_at = discovered_at - 31 * 86400")
     assert not db.is_discovered("x.test", 30)
     assert db.is_discovered("x.test", 0)  # 0 = never again
+
+
+TEXT = {"content-type": "text/plain"}
+
+
+def test_robots_refetched_after_24h(tmp_path):
+    routes = {"https://x.test/robots.txt": (200, ROBOTS_OK, TEXT),
+              "https://x.test/1": (200, recipe_page("one")),
+              "https://x.test/2": (200, recipe_page("two"))}
+    crawler, w, db = make(tmp_path, routes)
+    now = [0.0]
+    w.clock = lambda: now[0]
+    db.set_discovered("x.test", 0, 0)
+    db.add_urls("x.test", ["https://x.test/1"])
+    asyncio.run(w.run())
+    assert status(db, "https://x.test/1") == ("done", 0)
+
+    routes["https://x.test/robots.txt"] = (200, "User-agent: *\nDisallow: /\n", TEXT)
+    db.add_urls("x.test", ["https://x.test/2"])
+    now[0] = 23 * 3600
+    asyncio.run(w.crawl())  # still the cached robots.txt
+    assert status(db, "https://x.test/2") == ("done", 0)
+    db.add_urls("x.test", ["https://x.test/3"])
+    now[0] = 25 * 3600
+    asyncio.run(w.crawl())
+    assert status(db, "https://x.test/3") == ("blocked", 0)
+    assert crawler.fetcher.requests.count("https://x.test/robots.txt") == 2
+
+
+def test_redirects_are_checked_against_robots(tmp_path):
+    routes = {"https://x.test/robots.txt": (200, ROBOTS_OK, TEXT),
+              "https://x.test/a": (301, "", {"location": "/recipe/a"}),
+              "https://x.test/recipe/a": (200, recipe_page("a")),
+              "https://x.test/b": (302, "", {"location": "https://other.test/private/b"}),
+              "https://other.test/robots.txt": (200, "User-agent: *\nDisallow: /private/\n", TEXT),
+              "https://x.test/loop": (302, "", {"location": "/loop"})}
+    crawler, w, db = make(tmp_path, routes)
+    db.set_discovered("x.test", 0, 0)
+    db.add_urls("x.test", ["https://x.test/a", "https://x.test/b", "https://x.test/loop"])
+    asyncio.run(w.run())
+    assert status(db, "https://x.test/a") == ("done", 0)
+    assert db.recipe_count() == 1
+    assert status(db, "https://x.test/b") == ("blocked", 0)
+    assert "https://other.test/private/b" not in crawler.fetcher.requests
+    assert status(db, "https://x.test/loop") == ("blocked", 0)
+    assert crawler.fetcher.requests.count("https://x.test/loop") == 6  # 1 + 5 redirects, then given up
+
+
+def test_child_sitemap_on_other_host_uses_that_hosts_robots(tmp_path):
+    xml = {"content-type": "application/xml"}
+    index = SITEMAP_INDEX.replace("https://x.test/sm-2.xml", "https://cdn.test/sm-2.xml")
+    routes = {"https://x.test/robots.txt": (200, ROBOTS_OK + "Sitemap: https://x.test/index.xml\n", TEXT),
+              "https://cdn.test/robots.txt": (200, "User-agent: *\nDisallow: /\n", TEXT),
+              "https://x.test/index.xml": (200, index, xml),
+              "https://x.test/sm-1.xml": (200, urlset("https://x.test/r/1"), xml),
+              "https://cdn.test/sm-2.xml": (200, urlset("https://x.test/r/2"), xml)}
+    crawler, w, db = make(tmp_path, routes)
+    asyncio.run(w.run(discover_only=True))
+    assert "https://cdn.test/sm-2.xml" not in crawler.fetcher.requests
+    assert [r[0] for r in db.conn.execute("SELECT url FROM urls")] == ["https://x.test/r/1"]
