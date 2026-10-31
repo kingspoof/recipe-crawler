@@ -405,3 +405,30 @@ def test_per_day_429_remembered_by_next_run(db, cfg):
     usage = UsageLog(cfg.usage_log)
     assert usage.used_today(["k1"])[fingerprint("k1"), "m"] == 1
     assert usage.exhausted == {(fingerprint("k1"), "m")}
+
+
+def test_always_failing_batch_is_charged_instead_of_burning_the_quota(db, cfg):
+    """Regression: a batch that always got a 500 went back to the front with the same attempt count."""
+    add_lines(db.conn, "a", "b")
+    client = FakeClient(lambda n, lines: (_ for _ in ()).throw(ApiError(500, "internal")))
+    p, reason = run(db, cfg, [client])
+    # max_attempts = 2, charged after MAX_TRANSIENT = 2 failed calls, each call = 1 + MAX_RETRIES requests
+    assert reason == "done" and len(client.calls) == 2 * 2 * (1 + gemini.MAX_RETRIES)
+    assert statuses(db.conn) == {"a": -1, "b": -1}
+    assert p.failed == 2
+
+
+def test_429_is_never_charged_to_the_lines(db, cfg):
+    add_lines(db.conn, "a")
+    clock = FakeClock()
+    client = FakeClient(lambda n, lines: (_ for _ in ()).throw(ApiError(429, "slow down", {})) if n <= 3 else None)
+    run(db, cfg, [client], clock=clock)
+    assert statuses(db.conn) == {"a": 1}
+
+
+def test_local_bug_is_not_a_network_error(db, cfg):
+    add_lines(db.conn, "a")
+    client = FakeClient(lambda n, lines: (_ for _ in ()).throw(TypeError("bug in our code")))
+    with pytest.raises(TypeError):
+        run(db, cfg, [client])
+    assert len(client.calls) == 1  # not retried 5 times as if it were a connection reset

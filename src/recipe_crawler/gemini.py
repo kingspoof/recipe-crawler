@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from .config import IngredientSettings
 
 log = logging.getLogger("gemini")
@@ -27,6 +29,12 @@ log = logging.getLogger("gemini")
 QUOTA_TZ = ZoneInfo("America/Los_Angeles")  # daily quotas reset at midnight Pacific time
 RETRY_WAIT = 15.0  # 5xx / network: 15, 30, 60, 120, 240 s
 MAX_RETRIES = 5
+# A batch whose request failed this often with 5xx / network errors (each time after MAX_RETRIES retries) is
+# charged one attempt per line, like lines the model left out. Otherwise one batch that always gets a 500 goes
+# back to the front of the queue forever and uses up the whole day's quota.
+MAX_TRANSIENT = 2
+# What a network problem looks like from google-genai (it uses httpx). Anything else is a bug and is raised.
+NETWORK_ERRORS = (httpx.HTTPError, OSError, TimeoutError)
 
 UNITS = ["g", "kg", "mg", "ml", "cl", "dl", "l", "tsp", "tbsp", "cup", "oz", "lb", "fl oz", "pinch", "dash", "piece",
          "clove", "slice", "sheet", "can", "jar", "package", "bunch", "sprig", "stalk", "leaf", "handful", "drop"]
@@ -231,7 +239,7 @@ def call(client: Client, key: str, model: str, lines: list[str], cfg: Ingredient
             if e.code == 429:  # says which limit was hit (per minute / per day, requests / tokens)
                 rec["details"] = json.dumps(e.details, ensure_ascii=False)[:2000]
             retry = e.code is not None and e.code >= 500
-        except Exception as e:  # connection reset, timeout, ...
+        except NETWORK_ERRORS as e:  # connection reset, timeout, ...
             rec.update(ts=time.time(), latency=time.time() - t, retries=attempt, error=f"network {e!r}"[:300])
             retry = True
         usage.write(rec)
@@ -308,6 +316,7 @@ class Line:
     id: int
     text: str  # what is sent: the original spelling if there is one, else the lowercase key
     attempts: int = 0  # times the model left it out so far
+    transient: int = 0  # requests with this line that failed with 5xx / network since the last charge
 
 
 # save(answered [(line id, items)], failed [line id], model)
@@ -423,9 +432,28 @@ class Processor:
             lane.exhausted = True
             return
         if result is None and transient(rec):
-            retry.extendleft(reversed(batch))  # not the lines' fault: same attempt count
-            quota_ids = sorted(set(re.findall(r'"quotaId": "([^"]+)"', rec.get("details", ""))))
-            log.warning("%s: %s, batch goes back in the queue %s", lane.name, error[:100], ", ".join(quota_ids))
+            if not error.startswith("429"):
+                for line in batch:
+                    line.transient += 1
+            charged = [line for line in batch if line.transient >= MAX_TRANSIENT]
+            if not charged:
+                retry.extendleft(reversed(batch))  # not the lines' fault: same attempt count
+                quota_ids = sorted(set(re.findall(r'"quotaId": "([^"]+)"', rec.get("details", ""))))
+                log.warning("%s: %s, batch goes back in the queue %s", lane.name, error[:100], ", ".join(quota_ids))
+                return
+            failed = []
+            for line in batch:
+                line.transient = 0
+                line.attempts += 1
+                if line.attempts >= self.cfg.max_attempts:
+                    failed.append(line.id)
+                else:
+                    retry.append(line)  # to the back, so it is sent in a different batch next time
+            log.warning("%s: %s, %d failed requests in a row for this batch: charged one attempt (%d lines failed)",
+                        lane.name, error[:100], MAX_TRANSIENT, len(failed))
+            if failed:
+                self.save([], failed, lane.model)
+                self.failed += len(failed)
             return
         parsed = parse(len(batch), result)
         answered, failed = [], []
