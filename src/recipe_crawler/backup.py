@@ -212,11 +212,17 @@ def check(cfg: BackupSettings, max_age_days: float = 2) -> tuple[bool, list[str]
 
 
 def checkpoint(db_path: Path) -> str:
-    """Moves the WAL into the database and truncates it (end of the daily job). Busy while others read or
-    write: then only part of it is checkpointed, which is harmless."""
-    con = sqlite3.connect(db_path, timeout=60)
+    """Moves the WAL into the database and truncates it (end of the daily job).
+
+    TRUNCATE waits for readers and holds off writers while it waits, so it gets only a 1 s busy timeout; if
+    others are busy, a PASSIVE checkpoint (never blocks anyone) does what it can instead."""
+    con = sqlite3.connect(db_path, timeout=1)
     try:
         busy, log_pages, done = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        mode = "truncate"
+        if busy:
+            busy, log_pages, done = con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            mode = "passive"
     finally:
         con.close()
-    return f"wal checkpoint: {'busy, partial' if busy else 'complete'} ({done}/{log_pages} pages)"
+    return f"wal checkpoint ({mode}): {done}/{log_pages} pages"

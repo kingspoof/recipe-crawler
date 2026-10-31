@@ -110,3 +110,36 @@ def test_cli_backup_and_check(live, tmp_path, capsys):
     assert "daily-" in out and "full-" in out and "wal checkpoint" in out
     main(["-c", str(path), "check"])
     assert "quick_check ok" in capsys.readouterr().out
+
+
+def test_checkpoint_does_not_block_writers_behind_a_reader(live, tmp_path):
+    """Regression (review S1): TRUNCATE with a 60 s timeout held off writers while a reader was open."""
+    import threading
+
+    path = tmp_path / "data" / "r.db"
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM urls").fetchone()  # an open read snapshot (e.g. `export`)
+    live.add_urls("x.test", [f"https://x.test/{i}" for i in range(100)])
+    errors = []
+
+    def writer():
+        con = sqlite3.connect(path, timeout=5, isolation_level=None)
+        try:
+            time.sleep(0.1)
+            con.execute("INSERT INTO domains(domain) VALUES ('during checkpoint')")
+        except sqlite3.OperationalError as e:
+            errors.append(e)
+        finally:
+            con.close()
+
+    t = threading.Thread(target=writer)
+    t.start()
+    start = time.time()
+    result = backup.checkpoint(path)
+    t.join()
+    assert time.time() - start < 3 and not errors
+    assert "passive" in result
+    reader.execute("COMMIT")
+    assert "truncate" in backup.checkpoint(path)
+    reader.close()
