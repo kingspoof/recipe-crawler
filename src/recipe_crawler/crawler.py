@@ -28,6 +28,9 @@ YIELD_CHECK_AFTER = 300
 MIN_RECIPE_YIELD = 0.05
 # RFC 9309: a cached robots.txt should not be used for more than 24 hours. A crawl can run for days.
 ROBOTS_MAX_AGE = 24 * 3600
+# robots.txt unreachable (5xx / network): try again after this long. Meanwhile a previously fetched copy is
+# kept (RFC 9309 2.4: the 24 h limit does not apply while robots.txt is unreachable).
+ROBOTS_RETRY = 3600
 MAX_REDIRECTS = 5
 REDIRECTS = (301, 302, 303, 307, 308)
 # After a stop request, workers get this long to finish the request in flight, then they are cancelled
@@ -45,7 +48,7 @@ class DomainWorker:
         self.c = crawler
         self.site = site
         self.robots: Robots | None = None  # of the site itself, as of the last fetch
-        self._robots: dict[str, tuple[Robots, float]] = {}  # origin -> (robots.txt, fetched at), every host
+        self._robots: dict[str, tuple[Robots, float]] = {}  # origin -> (robots.txt, valid until), every host
         self.clock = time.monotonic
         self.throttle = Throttle(site.delay or crawler.settings.default_delay)
         self.consecutive_failures = 0
@@ -61,14 +64,21 @@ class DomainWorker:
         """robots.txt of the URL's host (www.x and x are different hosts), fetched again after 24 h."""
         origin = _origin(url)
         cached = self._robots.get(origin)
-        if cached and self.clock() - cached[1] < ROBOTS_MAX_AGE:
+        if cached and self.clock() < cached[1]:
             return cached[0]
         await self.throttle.wait()
         robots, problem = await fetch_robots(self.c.fetcher, origin)
         self.throttle.done()
+        valid = ROBOTS_MAX_AGE
         if problem:
             self.log.info("%s: %s", origin, problem)
-        self._robots[origin] = (robots, self.clock())
+            if "bot blocking" not in problem:  # temporary (5xx, 429, network): not a decision of the site
+                valid = ROBOTS_RETRY
+                if cached and not cached[0].unreachable:
+                    self.log.info("%s: keeping the robots.txt from before, retrying in %d min", origin,
+                                  ROBOTS_RETRY // 60)
+                    robots = cached[0]
+        self._robots[origin] = (robots, self.clock() + valid)
         if origin == _origin(self.site.base_url):
             self.robots = robots
         return robots

@@ -257,3 +257,40 @@ def test_total_timeout_for_a_trickling_server():
         await f.aclose()
 
     asyncio.run(main())
+
+
+def test_failed_robots_refetch_keeps_the_old_copy_and_retries_in_an_hour(tmp_path):
+    """Regression (review S2): one failed refetch after 24 h paused the domain for the rest of the run."""
+    routes = {"https://x.test/robots.txt": (200, ROBOTS_OK, TEXT),
+              "https://x.test/1": (200, recipe_page("one")),
+              "https://x.test/2": (200, recipe_page("two"))}
+    crawler, w, db = make(tmp_path, routes)
+    now = [0.0]
+    w.clock = lambda: now[0]
+    db.set_discovered("x.test", 0, 0)
+    db.add_urls("x.test", ["https://x.test/1"])
+    asyncio.run(w.run())
+    routes["https://x.test/robots.txt"] = (503, "", TEXT)
+    now[0] = 25 * 3600
+    db.add_urls("x.test", ["https://x.test/2"])
+    asyncio.run(w.crawl())
+    assert status(db, "https://x.test/2") == ("done", 0)  # the old copy still applies
+    fetches = crawler.fetcher.requests.count("https://x.test/robots.txt")
+    now[0] += 30 * 60
+    asyncio.run(w.robots_for("https://x.test/3"))
+    assert crawler.fetcher.requests.count("https://x.test/robots.txt") == fetches  # not every URL
+    now[0] += 31 * 60
+    asyncio.run(w.robots_for("https://x.test/3"))
+    assert crawler.fetcher.requests.count("https://x.test/robots.txt") == fetches + 1  # after an hour
+
+
+def test_unreachable_redirect_host_is_retried_after_an_hour(tmp_path):
+    routes = {"https://x.test/robots.txt": (200, ROBOTS_OK, TEXT),
+              "https://other.test/robots.txt": (503, "", TEXT)}
+    crawler, w, db = make(tmp_path, routes)
+    now = [0.0]
+    w.clock = lambda: now[0]
+    assert asyncio.run(w.robots_for("https://other.test/a")).unreachable
+    routes["https://other.test/robots.txt"] = (200, ROBOTS_OK, TEXT)
+    now[0] = 3601
+    assert not asyncio.run(w.robots_for("https://other.test/a")).unreachable  # not cached for 24 h
