@@ -598,3 +598,22 @@ def test_after_the_first_spool_answers_go_straight_to_the_spool(db, cfg):
 def test_save_connection_gets_a_short_busy_timeout(db):
     ingredients.make_save(db.conn)
     assert db.conn.execute("PRAGMA busy_timeout").fetchone()[0] == ingredients.SAVE_BUSY_TIMEOUT_MS
+
+
+def test_no_busy_polling_while_only_waiting_for_requests_in_flight(db, cfg, monkeypatch):
+    """Regression (review M1): with nothing left to send the loop waited 10 ms at a time."""
+    cfg.batch_size, cfg.in_flight = 1, 2  # the lane could send more: only "nothing left" stops it
+    add_lines(db.conn, "a")
+    timeouts = []
+    real_wait = gemini.wait
+
+    def wait(fs, timeout=None, return_when=None):
+        timeouts.append(timeout)
+        return real_wait(fs, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(gemini, "wait", wait)
+    client = FakeClient(lambda n, lines: time.sleep(0.3) or None)
+    p = Processor(cfg, [Lane("k1", client, "m", 0, cfg.rpd)], UsageLog(cfg.usage_log),
+                  ingredients.make_save(db.conn))  # real clock: the lane is ready again after 10 ms
+    assert p.run(ingredients.todo_lines(db.conn)) == "done"
+    assert len(timeouts) <= 2 and all(t == 2.0 for t in timeouts)
