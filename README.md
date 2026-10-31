@@ -55,10 +55,17 @@ uv run recipe-crawler --log-file data.nosync/ingredients.log process   # log to 
   `stagger` seconds apart; a short-term 429 pauses a lane for 2, 4, 8 … 30 min, a per-day 429 ends it for today.
 - **Stopping**: Ctrl+C / SIGTERM stops sending, waits for the requests in flight and saves them; a second
   Ctrl+C aborts. Every answer is saved right away, so restarting is always safe.
-- **Database errors**: a failed save is retried; if the database still can't be written (locked, disk full), the
-  answers go to `data.nosync/unsaved_answers.jsonl`, no new requests are sent, and the next `process` saves them
-  first. A batch that fails with 5xx / network errors twice is charged one attempt per line, so one bad batch
-  can't use up the day's quota.
+- **Server and network errors** are never counted against the lines. A network error (no answer) pauses the
+  lane for 2, 4, 8 … 30 min. A 5xx pauses the lane too, unless other requests of the same model succeed in
+  between: then the batch itself is the problem and is split in halves, down to single lines. A single line that
+  still fails twice that way gets **status -3** ("gave up (server errors)" in `stats`). It is safe to retry:
+  `sqlite3 data.nosync/recipes.db "UPDATE ingredient_lines SET status = 0 WHERE status = -3;"`
+  (status -1 = the model left the line out twice; reset it the same way to try again).
+- **Database errors**: a failed save is retried 3 times (10 s busy timeout each); if the database still can't be
+  written (locked, disk full), the answers go to `data.nosync/unsaved_answers.jsonl`, no new requests are sent,
+  later answers go straight to that file, and the next `process` saves them first. So if `process` stops with
+  "database not writable" after about half a minute, nothing is lost: find what held the lock (`map --full`,
+  `sqlite3` left open in a transaction, a full disk) and run `process` again.
 - `names` is a stub for the next step (merging names like "cilantro" / "coriander" via `ingredient_names`).
 
 ## Database safety
@@ -82,7 +89,12 @@ uv run recipe-crawler check           # quick_check of the newest backups; exit 
   `recipes.db-shm` aside, copy the backup to `data.nosync/recipes.db`.
 - **Restore the daily tables** (e.g. `ingredient_lines` after a bad edit): `gunzip -k daily-….db.gz`, then in
   `sqlite3 data.nosync/recipes.db`: `ATTACH 'daily-….db' AS b; BEGIN; DELETE FROM ingredient_lines;
-  INSERT INTO ingredient_lines SELECT * FROM b.ingredient_lines; COMMIT;`
+  INSERT INTO ingredient_lines (id, line, n, status, items, model, done_at, original)
+  SELECT id, line, n, status, items, model, done_at, original FROM b.ingredient_lines; COMMIT;`
+  Always name the columns: a backup from an older schema can have fewer (e.g. `domains` before schema v2 has no
+  `incomplete_discoveries`), so for `domains` use
+  `INSERT INTO domains (domain, discovered_at, sitemaps_read, urls_found) SELECT domain, discovered_at,
+  sitemaps_read, urls_found FROM b.domains;`
 - **Schema versions** live in `src/recipe_crawler/schema.py` (`PRAGMA user_version`). A migration runs on the
   first write command after an update, takes a full backup first when it changes data, and refuses to run while
   another `recipe-crawler` process uses the database. Read-only commands (`stats`, `export`, `names`,
