@@ -143,3 +143,28 @@ def test_checkpoint_does_not_block_writers_behind_a_reader(live, tmp_path):
     reader.execute("COMMIT")
     assert "truncate" in backup.checkpoint(path)
     reader.close()
+
+
+def test_daily_refuses_without_enough_space(live, cfg, tmp_path, monkeypatch):
+    """Review M4: daily had no free-space check."""
+    import collections
+
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(backup.shutil, "disk_usage", lambda p: usage(10, 10, 0))
+    with pytest.raises(SystemExit, match="Not enough space"):
+        backup.daily(tmp_path / "data" / "r.db", cfg)
+    assert not list(cfg.dir.iterdir())
+
+
+def test_tables_size_without_dbstat(live, tmp_path):
+    con = sqlite3.connect(tmp_path / "data" / "r.db")
+    with_dbstat = backup._tables_size(con, ("ingredient_lines",))
+
+    class NoDbstat:  # a SQLite build without the dbstat table
+        def execute(self, sql, *a):
+            if "dbstat" in sql:
+                raise sqlite3.OperationalError("no such table: dbstat")
+            return con.execute(sql, *a)
+
+    assert with_dbstat > 0 and backup._tables_size(NoDbstat(), ("ingredient_lines",)) > 0
+    con.close()

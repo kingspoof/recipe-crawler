@@ -69,11 +69,34 @@ def _free_space_check(directory: Path, needed: int) -> None:
         raise SystemExit(f"Not enough space in {directory}: {free / 1e9:.1f} GB free, ~{needed / 1e9:.1f} GB needed.")
 
 
+def _tables_size(con: sqlite3.Connection, tables: tuple[str, ...]) -> int:
+    """Bytes the tables take: from dbstat if SQLite has it, else summed up from the column values."""
+    tables = tuple(t for t in tables if has_table(con, t))
+    if not tables:
+        return 0
+    try:
+        return con.execute(f"SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name IN "
+                           f"({','.join('?' * len(tables))})", tables).fetchone()[0]
+    except sqlite3.OperationalError:  # no dbstat in this SQLite build
+        total = 0
+        for t in tables:
+            cols = [r[1] for r in con.execute(f"PRAGMA table_info({t})")]
+            expr = " + ".join(f"COALESCE(LENGTH({c}), 0) + 8" for c in cols)
+            total += con.execute(f"SELECT COALESCE(SUM({expr}), 0) FROM {t}").fetchone()[0] * 2  # + indexes
+        return total
+
+
 def daily(db_path: Path, cfg: BackupSettings) -> Path:
     directory = backup_dir(cfg)
     final = directory / f"daily-{_stamp()}.db.gz"
     tmp = directory / (final.name.removesuffix(".gz") + ".partial")
     src = _connect_ro(db_path)
+    try:
+        # the uncompressed copy and the .gz exist at the same time for a moment
+        _free_space_check(directory, int(_tables_size(src, cfg.DAILY_TABLES) * 1.5))
+    except BaseException:
+        src.close()
+        raise
     dst = sqlite3.connect(tmp)
     try:
         src.execute("BEGIN")  # one read snapshot for every table, while other processes keep writing
