@@ -432,3 +432,26 @@ def test_local_bug_is_not_a_network_error(db, cfg):
     with pytest.raises(TypeError):
         run(db, cfg, [client])
     assert len(client.calls) == 1  # not retried 5 times as if it were a connection reset
+
+
+def test_truncated_answer_keeps_complete_objects(db, cfg):
+    """Regression: a MAX_TOKENS answer failed the whole batch; after 2 tries every line was -1."""
+    cfg.batch_size = 4
+    add_lines(db.conn, "a", "b", "c", "d")
+
+    def handler(n, lines):
+        if n == 1:
+            text = answer(lines).text
+            return Reply(text[:text.index('{"i": 2')] + '{"i": 2, "en": "c', {}, "MAX_TOKENS")  # cut inside c
+
+    client = FakeClient(handler)
+    run(db, cfg, [client])
+    assert statuses(db.conn) == {"a": 1, "b": 1, "c": 1, "d": 1}
+    assert client.calls == [["a", "b", "c", "d"], ["c", "d"]]
+    rec = usage_records(cfg)[0]
+    assert rec["truncated"] == 2 and rec["error"].startswith("bad json")
+
+
+def test_salvage():
+    assert gemini.salvage('[{"i": 0}, {"i": 1}, {"i"') == [{"i": 0}, {"i": 1}]
+    assert gemini.salvage("[") == [] and gemini.salvage("oops") == []

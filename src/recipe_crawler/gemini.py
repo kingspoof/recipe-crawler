@@ -254,8 +254,28 @@ def call(client: Client, key: str, model: str, lines: list[str], cfg: Ingredient
     except (json.JSONDecodeError, TypeError) as e:  # e.g. cut off at MAX_TOKENS
         rec["error"] = f"bad json: {e}"[:300]
         result = None
+        if reply.finish == "MAX_TOKENS" and reply.text:
+            result = salvage(reply.text)  # keep the objects that were complete
+            rec["truncated"] = len(result)
     usage.write(rec)
     return result, rec
+
+
+def salvage(text: str) -> list:
+    """The complete objects at the start of a JSON array that was cut off."""
+    decoder = json.JSONDecoder()
+    out: list = []
+    pos = text.find("[") + 1
+    if not pos:
+        return out
+    while True:
+        while pos < len(text) and text[pos] in " \t\r\n,":
+            pos += 1
+        try:
+            obj, pos = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError:
+            return out
+        out.append(obj)
 
 
 def parse(n_lines: int, result: Any) -> dict[int, list]:
@@ -456,10 +476,15 @@ class Processor:
                 self.failed += len(failed)
             return
         parsed = parse(len(batch), result)
+        # Cut off at MAX_TOKENS: the lines after the cut were never reached, so they are not charged. The line
+        # at the cut is (it may be the one that makes the answer explode), and so are gaps before it.
+        cut = max(parsed, default=-1) + 1 if "truncated" in rec else len(batch)
         answered, failed = [], []
         for i, line in enumerate(batch):
             if i in parsed:
                 answered.append((line.id, parsed[i]))
+            elif i > cut:
+                retry.append(line)
             elif line.attempts + 1 >= self.cfg.max_attempts:
                 failed.append(line.id)
             else:
