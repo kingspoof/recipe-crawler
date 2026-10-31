@@ -5,7 +5,9 @@ Everything is persisted, so the crawler can be stopped (Ctrl+C) and resumed.
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import sqlite3
 import time
 import logging
@@ -50,6 +52,31 @@ def transaction(conn: sqlite3.Connection, immediate: bool = True) -> Iterator[No
 log = logging.getLogger("db")
 
 
+class Busy(SystemExit):
+    pass
+
+
+def lock_file(path: Path, exclusive: bool, wait: bool = False) -> int:
+    """flock on `path` (created if missing); returns the fd, which holds the lock until closed."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        os.close(fd)
+        raise Busy(f"{path} is locked by another recipe-crawler process") from None
+    return fd
+
+
+def single_instance(db_path: Path, name: str) -> int:
+    """At most one `crawl`, one `process`, ... per database at a time (two `process` runs would each think
+    they have the whole quota). Returns the lock's fd: keep it open for the whole command."""
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        return lock_file(Path(f"{db_path}.{name}.lock"), exclusive=True)
+    except Busy:
+        raise Busy(f"another `recipe-crawler {name}` is already running on {db_path}") from None
+
+
 class DB:
     """readonly: for commands that only read (stats, export, dry runs). Opened with mode=ro, so nothing, not even
     a migration, can write; a missing database is an error instead of an empty new file.
@@ -70,6 +97,7 @@ class DB:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
             self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=timeout)
         self.conn.row_factory = sqlite3.Row
+        self._lock_fd: int | None = None
         if readonly:
             v = schema.version(self.conn)
             if v != schema.CURRENT:
@@ -81,10 +109,33 @@ class DB:
         # After a checkpoint, the -wal file is truncated to this size instead of keeping its peak size
         # (`map --full` used to leave GBs behind).
         self.conn.execute(f"PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT}")
-        schema.migrate(self.conn, backup)
+        if memory:
+            schema.migrate(self.conn, backup)
+            return
+        # Every writing process holds a shared lock on recipes.db.lock; a migration needs it exclusively, so
+        # it never changes the schema under a running `crawl` that still uses the old one.
+        lock = Path(f"{path}.lock")
+        if schema.pending(self.conn):
+            try:
+                self._lock_fd = lock_file(lock, exclusive=True)
+            except Busy:
+                self.conn.close()
+                raise Busy(f"The database needs a schema migration (to version {schema.CURRENT}), but another "
+                           "recipe-crawler process is using it: stop it, then run this again.") from None
+            try:
+                schema.migrate(self.conn, backup)
+            except BaseException:
+                self.close()
+                raise
+            fcntl.flock(self._lock_fd, fcntl.LOCK_SH)  # downgrade: other commands may start now
+        else:
+            self._lock_fd = lock_file(lock, exclusive=False, wait=True)  # waits only for a running migration
 
     def close(self) -> None:
         self.conn.close()
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
 
     # ------------------------------------------------------------------ frontier
 

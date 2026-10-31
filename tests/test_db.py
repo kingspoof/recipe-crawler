@@ -38,3 +38,33 @@ def test_transaction_rolls_back_and_refuses_to_nest(tmp_path):
             with transaction(db.conn):
                 pass
     db.close()
+
+
+def test_migration_waits_for_no_other_process(tmp_path, monkeypatch):
+    from recipe_crawler import schema
+    from recipe_crawler.db import Busy
+
+    path = tmp_path / "r.db"
+    running = DB(path)  # e.g. a long `crawl`: holds the shared lock
+    monkeypatch.setattr(schema, "MIGRATIONS", schema.MIGRATIONS + [
+        schema.Migration(2, "x", lambda c: c.execute("CREATE TABLE x (a)"), backup=False)])
+    monkeypatch.setattr(schema, "CURRENT", 2)
+    with pytest.raises(Busy, match="stop it"):
+        DB(path)
+    running.close()
+    db = DB(path)  # now it may migrate
+    assert schema.version(db.conn) == 2
+    DB(path).close()  # and others can open it next to it (lock downgraded to shared)
+    db.close()
+
+
+def test_single_instance(tmp_path):
+    from recipe_crawler.db import Busy, single_instance
+    import os
+
+    fd = single_instance(tmp_path / "r.db", "process")
+    with pytest.raises(Busy, match="process"):
+        single_instance(tmp_path / "r.db", "process")
+    single_instance(tmp_path / "r.db", "crawl")  # a different command is fine
+    os.close(fd)
+    single_instance(tmp_path / "r.db", "process")

@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 from . import backup, gemini, ingredients
 from .config import Settings, Site, load_config
 from .crawler import Crawler
-from .db import DB
+from .db import DB, single_instance
 from .probe import probe_site
 
 
@@ -299,25 +299,33 @@ def main(argv: list[str] | None = None) -> None:
         logging.getLogger("crawler").setLevel(logging.ERROR)
     settings = load_config(args.config, require_contact=args.cmd in ("probe", "discover", "crawl"))
 
-    if args.cmd == "probe":
-        cmd_probe(settings, args)
-    elif args.cmd == "discover":
-        cmd_crawl(settings, args, discover_only=True)
-    elif args.cmd == "crawl":
-        cmd_crawl(settings, args)
-    elif args.cmd == "stats":
-        cmd_stats(settings, args)
-    elif args.cmd == "export":
-        cmd_export(settings, args)
-    elif args.cmd == "lines":
-        cmd_lines(settings, args)
-    elif args.cmd == "process":
-        cmd_process(settings, args)
-    elif args.cmd == "map":
-        cmd_map(settings, args)
-    elif args.cmd == "names":
-        cmd_names(settings, args)
-    elif args.cmd == "backup":
-        cmd_backup(settings, args)
-    elif args.cmd == "check":
-        cmd_check(settings, args)
+    # One instance per command and database (discover and crawl count as one).
+    instance = {"discover": "crawl", "crawl": "crawl", "lines": "lines", "map": "map", "backup": "backup",
+                "process": None if getattr(args, "dry_run", False) else "process"}.get(args.cmd)
+    lock = single_instance(settings.db_path, instance) if instance else None
+    try:
+        if args.cmd == "probe":
+            cmd_probe(settings, args)
+        elif args.cmd == "discover":
+            cmd_crawl(settings, args, discover_only=True)
+        elif args.cmd == "crawl":
+            cmd_crawl(settings, args)
+        elif args.cmd == "stats":
+            cmd_stats(settings, args)
+        elif args.cmd == "export":
+            cmd_export(settings, args)
+        elif args.cmd == "lines":
+            cmd_lines(settings, args)
+        elif args.cmd == "process":
+            cmd_process(settings, args)
+        elif args.cmd == "map":
+            cmd_map(settings, args)
+        elif args.cmd == "names":
+            cmd_names(settings, args)
+        elif args.cmd == "backup":
+            cmd_backup(settings, args)
+        elif args.cmd == "check":
+            cmd_check(settings, args)
+    finally:
+        if lock is not None:
+            os.close(lock)
