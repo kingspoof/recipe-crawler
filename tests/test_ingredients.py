@@ -675,3 +675,31 @@ def test_blame_needs_successes_of_the_same_model(cfg):
     p._server_error(down2, batch, "500 internal", retry, todo)
     assert list(retry) == batch and all(line.max_batch == 1 for line in batch)  # split
     assert down2.paused_until > clock.t  # down2 never got an answer: paused although the batch is blamed
+
+
+def test_network_errors_are_never_blamed_on_the_batch(db, cfg):
+    """Review N6: one batch keeps getting network errors while other batches succeed."""
+    cfg.batch_size, cfg.rpm, cfg.rpd = 1, 60, 10_000
+    add_lines(db.conn, "unlucky", *[f"line {i}" for i in range(300)])
+    fails = {"n": 0}
+
+    def handler(n, lines):
+        if lines[0][1] == "unlucky" and fails["n"] < 60:
+            fails["n"] += 1
+            raise ConnectionError("reset")
+
+    # two lanes of the same model: the other one keeps succeeding while "unlucky" fails
+    _, reason = run(db, cfg, [FakeClient(handler), FakeClient(handler)], keys=("k1", "k2"))
+    assert reason == "done" and set(statuses(db.conn).values()) == {1}
+
+def test_network_error_is_not_blamed_even_when_others_succeed(cfg):
+    """Review N6, pinned at the decision."""
+    clock = FakeClock()
+    lane = Lane("k1", FakeClient(), "m", 0, cfg.rpd)
+    p = Processor(cfg, [lane], UsageLog(cfg.usage_log), lambda *a: None, clock=clock, sleep=clock.sleep)
+    batch = [Line(1, "a"), Line(2, "b")]
+    for _ in range(5):
+        retry, todo = deque(), deque([Line(9, "other")])
+        p._server_error(lane, batch, "network ConnectError()", retry, todo)
+        p.successes["m"] += 3  # other batches keep succeeding in between
+        assert list(retry) == batch and all(line.max_batch == 0 and line.server_errors == 0 for line in batch)
