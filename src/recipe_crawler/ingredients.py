@@ -23,9 +23,11 @@ import logging
 import sqlite3
 import time
 from collections import Counter
+from typing import Callable
 from .config import IngredientSettings
 from .db import transaction as _tx
-from .gemini import Line, UsageLog, fingerprint, next_reset, quota_day, spool_read
+from .gemini import (PROMPT, Client, GeminiClient, Lane, Line, UsageLog, fingerprint, next_reset, quota_day,
+                     spool_read)
 
 log = logging.getLogger("ingredients")
 
@@ -157,6 +159,35 @@ def make_save(conn: sqlite3.Connection):
             )
             conn.executemany("UPDATE ingredient_lines SET status = -1 WHERE id = ?", [(id,) for id in failed])
     return save
+
+
+def build_lanes(cfg: IngredientSettings, keys: list[str], usage: UsageLog, used: Counter[tuple[str, str]],
+                client: Callable[[str], Client] = GeminiClient) -> list[Lane]:
+    """One lane per key x model, with today's usage; lanes that got a 429 PerDay today start exhausted."""
+    lanes = [Lane(k, client(k), m, used[fingerprint(k), m], cfg.rpd) for m in cfg.models for k in keys]
+    for lane in lanes:
+        lane.exhausted = (lane.key, lane.model) in usage.exhausted
+    return lanes
+
+
+def dry_run(conn: sqlite3.Connection, cfg: IngredientSettings, keys: list[str], used: Counter[tuple[str, str]],
+            show_prompt: bool = False) -> list[str]:
+    """What `process` would send. Reads only: no migrations, no requests, no usage records."""
+    if not _has_table(conn, "ingredient_lines"):
+        raise SystemExit("No ingredient_lines table yet: run `recipe-crawler lines` first.")
+    todo = todo_lines(conn)
+    out = [f"{len(todo):,} lines to do = {-(-len(todo) // cfg.batch_size):,} requests of {cfg.batch_size}"]
+    for k in keys:
+        for m in cfg.models:
+            out.append(f"  lane {fingerprint(k)}/{m}: {used[fingerprint(k), m]}/{cfg.rpd or '-'} used today")
+    first = [line.text for line in todo[:cfg.batch_size]]
+    out.append(f"first request ({len(first)} lines, prompt {len(PROMPT):,} chars):")
+    out += [f"  [{i}, {json.dumps(text, ensure_ascii=False)}]" for i, text in enumerate(first[:20])]
+    if len(first) > 20:
+        out.append(f"  ... {len(first) - 20} more")
+    if show_prompt:
+        out.append(PROMPT)
+    return out
 
 
 def spool_path(cfg: IngredientSettings):

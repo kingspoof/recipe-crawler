@@ -500,3 +500,12 @@ def test_bug_in_finished_waits_for_in_flight_then_raises(db, cfg, monkeypatch):
     with pytest.raises(KeyError):
         p.run(ingredients.todo_lines(db.conn))
     assert len(client.calls) == 2 and list(statuses(db.conn).values()).count(1) == 2  # the other one was saved
+
+
+def test_build_lanes_starts_per_day_429_lanes_exhausted(cfg):
+    cfg.models = ["m1", "m2"]
+    usage = UsageLog(cfg.usage_log)
+    usage.write({"day": gemini.quota_day(), "key": fingerprint("k1"), "model": "m2", "details": "PerDay"})
+    used = usage.used_today(["k1"])
+    lanes = ingredients.build_lanes(cfg, ["k1"], usage, used, client=lambda k: FakeClient())
+    assert [(lane.model, lane.used, lane.exhausted) for lane in lanes] == [("m1", 0, False), ("m2", 1, True)]
