@@ -105,3 +105,11 @@ def test_v2_adds_incomplete_discoveries_to_a_v1_database(tmp_path):
     assert tuple(db.conn.execute("SELECT domain, discovered_at, incomplete_discoveries FROM domains").fetchone()) == (
         "x", 1, 0)
     db.close()
+
+
+def test_every_migration_is_idempotent(tmp_path):
+    """Review N3: each migration also works when its change is already there."""
+    db = DB(tmp_path / "r.db")
+    for m in schema.MIGRATIONS:
+        m.apply(db.conn)  # again, on a database that already has everything
+    db.close()

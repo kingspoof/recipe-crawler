@@ -10,6 +10,8 @@ together with the version bump, so a crash leaves the database at the old or the
   ingredient_lines.original. On the existing database it only adds what is missing, so nothing is reprocessed.
 
 To change the schema: append a Migration with the next version. Never edit or reorder old ones.
+Every migration must be idempotent (check before it adds: a column, a table, an index), so that it also
+works on a database where the change was already made by hand or by an older checkout.
 """
 
 from __future__ import annotations
@@ -147,7 +149,8 @@ def _has_index_on(conn: sqlite3.Connection, table: str, column: str) -> bool:
 
 def _v2_incomplete_discoveries(conn: sqlite3.Connection) -> None:
     # schema only (no table rewrite), instant on the real database: no backup needed
-    conn.execute("ALTER TABLE domains ADD COLUMN incomplete_discoveries INTEGER NOT NULL DEFAULT 0")
+    if "incomplete_discoveries" not in columns(conn, "domains"):
+        conn.execute("ALTER TABLE domains ADD COLUMN incomplete_discoveries INTEGER NOT NULL DEFAULT 0")
 
 
 @dataclass(frozen=True)
