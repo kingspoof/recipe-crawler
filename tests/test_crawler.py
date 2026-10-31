@@ -7,7 +7,7 @@ import pytest
 from recipe_crawler.config import Settings, Site
 from recipe_crawler.crawler import Crawler, DomainWorker
 from recipe_crawler.db import DB
-from recipe_crawler.net import Response
+from recipe_crawler.net import Fetcher, Response, Throttle
 
 ROBOTS_OK = "User-agent: *\nAllow: /\n"
 
@@ -187,3 +187,73 @@ def test_child_sitemap_on_other_host_uses_that_hosts_robots(tmp_path):
     asyncio.run(w.run(discover_only=True))
     assert "https://cdn.test/sm-2.xml" not in crawler.fetcher.requests
     assert [r[0] for r in db.conn.execute("SELECT url FROM urls")] == ["https://x.test/r/1"]
+
+
+def test_throttle_wait_ends_on_stop():
+    async def main():
+        t = Throttle(3600)
+        t.done()
+        stop = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.05, stop.set)
+        await asyncio.wait_for(t.wait(stop), 2)  # would sleep an hour without the stop
+
+    asyncio.run(main())
+
+
+def test_stop_cancels_stuck_workers_and_leaves_urls_pending(tmp_path, monkeypatch):
+    from recipe_crawler import crawler as crawler_mod
+
+    monkeypatch.setattr(crawler_mod, "STOP_GRACE", 0.1)
+
+    routes = {"https://x.test/robots.txt": (200, ROBOTS_OK, TEXT), }
+    crawler, w, db = make(tmp_path, routes)
+    real_get = crawler.fetcher.get
+
+    async def get(url, max_bytes=None, follow_redirects=False):
+        if url == "https://x.test/1":
+            await asyncio.sleep(3600)  # a server that never answers
+        return await real_get(url, max_bytes, follow_redirects)
+
+    crawler.fetcher.get = get
+    db.set_discovered("x.test", 0, 0)
+    db.add_urls("x.test", ["https://x.test/1"])
+
+    async def main():
+        asyncio.get_running_loop().call_later(0.05, lambda: setattr(crawler, "stopping", True))
+        await asyncio.wait_for(crawler.run([w.site]), 5)
+
+    asyncio.run(main())
+    assert status(db, "https://x.test/1") == ("pending", 0)
+
+
+def test_stop_during_throttle_does_not_mark_url_as_error(tmp_path):
+    routes = {"https://x.test/robots.txt": (200, ROBOTS_OK, TEXT), "https://x.test/1": (200, recipe_page())}
+    crawler, w, db = make(tmp_path, routes)
+    db.set_discovered("x.test", 0, 0)
+    db.add_urls("x.test", ["https://x.test/1"])
+
+    async def main():
+        assert await w.setup()
+        w.throttle = Throttle(3600)
+        w.throttle.done()
+        asyncio.get_running_loop().call_later(0.05, lambda: setattr(crawler, "stopping", True))
+        await asyncio.wait_for(w._process("https://x.test/1"), 2)
+
+    asyncio.run(main())
+    assert status(db, "https://x.test/1") == ("pending", 0)
+
+
+def test_total_timeout_for_a_trickling_server():
+    async def main():
+        f = Fetcher("UA/1", timeout=30)
+        f.total_timeout = 0.05
+
+        async def trickle(*a):
+            await asyncio.sleep(10)
+
+        f._get = trickle
+        with pytest.raises(httpx.TimeoutException):
+            await f.get("https://x.test/")
+        await f.aclose()
+
+    asyncio.run(main())

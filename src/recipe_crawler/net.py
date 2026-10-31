@@ -63,6 +63,9 @@ class Response:
 class Fetcher:
     def __init__(self, user_agent: str, timeout: float):
         self.user_agent = user_agent
+        # httpx's timeout applies to each read, so a server that trickles bytes could hold a worker forever.
+        # This limits the whole request; sitemaps (up to 60 MB) get longer.
+        self.total_timeout = 2 * timeout
         # Token used to match robots.txt "User-agent:" groups, e.g. "RecipeResearchCrawler".
         self.robots_token = user_agent.split("/")[0].split(" ")[0]
         self.client = httpx.AsyncClient(
@@ -77,6 +80,14 @@ class Fetcher:
 
     async def get(self, url: str, max_bytes: int = MAX_PAGE_BYTES, follow_redirects: bool = False) -> Response:
         start = time.monotonic()
+        total = self.total_timeout * (5 if max_bytes > MAX_PAGE_BYTES else 1)
+        try:
+            async with asyncio.timeout(total):
+                return await self._get(url, max_bytes, follow_redirects, start)
+        except TimeoutError:
+            raise httpx.ReadTimeout(f"no complete response after {total:.0f} s") from None
+
+    async def _get(self, url: str, max_bytes: int, follow_redirects: bool, start: float) -> Response:
         async with self.client.stream("GET", url, follow_redirects=follow_redirects) as r:
             declared = r.headers.get("content-length")
             if declared and declared.isdigit() and int(declared) > max_bytes:
@@ -103,10 +114,18 @@ class Throttle:
         self.delay = delay
         self._next = 0.0
 
-    async def wait(self) -> None:
+    async def wait(self, stop: asyncio.Event | None = None) -> None:
+        """Sleeps until the next request may start; returns early when `stop` is set."""
         now = time.monotonic()
-        if now < self._next:
+        if now >= self._next:
+            return
+        if stop is None:
             await asyncio.sleep(self._next - now)
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), self._next - now)
+        except TimeoutError:
+            pass
 
     def done(self, elapsed: float = 0.0) -> None:
         # If the server is slow, slow down too.

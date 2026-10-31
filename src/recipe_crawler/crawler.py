@@ -30,6 +30,9 @@ MIN_RECIPE_YIELD = 0.05
 ROBOTS_MAX_AGE = 24 * 3600
 MAX_REDIRECTS = 5
 REDIRECTS = (301, 302, 303, 307, 308)
+# After a stop request, workers get this long to finish the request in flight, then they are cancelled
+# (the URL stays pending). Below systemd's TimeoutStopSec=90 in deploy/recipe-crawler.service.
+STOP_GRACE = 30.0
 
 
 def _origin(url: str) -> str:
@@ -103,7 +106,9 @@ class DomainWorker:
         return r
 
     async def _get_once(self, url: str, max_bytes: int | None = None) -> Response | None:
-        await self.throttle.wait()
+        await self.throttle.wait(self.c.stop_event)  # a stop ends the wait (up to an hour after a Retry-After)
+        if self.c.stopping:
+            return None
         try:
             r = await self.c.fetcher.get(url, max_bytes) if max_bytes else await self.c.fetcher.get(url)
         except (httpx.HTTPError, httpx.InvalidURL, TooLarge) as e:  # InvalidURL is not an HTTPError
@@ -224,6 +229,8 @@ class DomainWorker:
             self.db.mark(url, "no_recipe", error="filtered by url_pattern")
             return
         r = await self._get(url)
+        if r is None and self.c.stopping:
+            return  # not fetched: stays pending
         self.pages += 1
         if r is None:
             self.db.mark(url, "error", error="network", max_attempts=s.max_attempts)
@@ -286,10 +293,21 @@ class Crawler:
         self.settings = settings
         self.db = db
         self.fetcher = Fetcher(settings.user_agent, settings.timeout)
-        self.stopping = False
+        self.stop_event = asyncio.Event()
         self.total = db.recipe_count()
         self.region_total: defaultdict[str, int] = defaultdict(int, db.region_counts())
         self.workers: list[DomainWorker] = []
+
+    @property
+    def stopping(self) -> bool:
+        return self.stop_event.is_set()
+
+    @stopping.setter
+    def stopping(self, value: bool) -> None:
+        if value:
+            self.stop_event.set()
+        else:
+            self.stop_event.clear()
 
     def region_full(self, region: str) -> bool:
         cap = self.settings.max_recipes_per_region
@@ -320,8 +338,19 @@ class Crawler:
         order = [s for group in itertools.zip_longest(*by_region.values()) for s in group if s]
         self.workers = [DomainWorker(self, s) for s in order]
         reporter = asyncio.create_task(self._report())
+        tasks = [asyncio.create_task(guarded(w)) for w in self.workers]
+        all_done = asyncio.gather(*tasks)
+        stopped = asyncio.create_task(self.stop_event.wait())
         try:
-            await asyncio.gather(*(guarded(w) for w in self.workers))
+            await asyncio.wait([all_done, stopped], return_when=asyncio.FIRST_COMPLETED)
+            if not all_done.done():
+                _, pending = await asyncio.wait(tasks, timeout=STOP_GRACE)
+                if pending:
+                    log.warning("cancelling %d workers that did not stop within %.0f s", len(pending), STOP_GRACE)
+                    for t in pending:
+                        t.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
         finally:
+            stopped.cancel()
             reporter.cancel()
             await self.fetcher.aclose()
