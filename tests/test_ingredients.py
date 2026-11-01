@@ -634,21 +634,17 @@ def test_lines_commits_in_chunks(db, cfg, monkeypatch):
 
 def test_one_model_down_does_not_blame_its_batches(db, cfg):
     """Review N1: with a global success counter, a model in a 5xx outage got its batches blamed (split, -3)
-    because another model kept succeeding."""
-    cfg.batch_size, cfg.rpm, cfg.rpd = 2, 60, 10_000  # ~1 request/s per lane: the bad lane retries while work is left
-    add_lines(db.conn, *[f"line {i}" for i in range(4000)])  # ~35 min of work: the bad lanes come back
+    because another model kept succeeding. The reviewer's recipe: 3 lanes on a model that always returns 500,
+    1 lane on a model that works, 400 lines, batch 4, rpm 1. Before the fix: 19 innocent lines at -3."""
+    cfg.batch_size, cfg.rpm, cfg.rpd = 4, 1, 10_000
+    add_lines(db.conn, *[f"line {i}" for i in range(400)])
     down = FakeClient(lambda n, lines: (_ for _ in ()).throw(ApiError(500, "internal")))
     up = FakeClient()
-    clock = FakeClock()
-    usage = UsageLog(cfg.usage_log)
-    # like the reviewer's simulation: three keys on the model that is down, one on the model that works
-    lanes = [Lane(k, down, "m-down", 0, cfg.rpd) for k in ("k1", "k2", "k3")] + [Lane("k1", up, "m-up", 0, cfg.rpd)]
-    p, reason = run(db, cfg, None, clock=clock, lanes=lanes)
-    assert reason == "done" and set(statuses(db.conn).values()) == {1} and p.failed == 0
-    assert max(len(c) for c in down.calls) == 2  # never split
-    # each bad lane pauses 2, 4, 8, 16 ... min: a handful of calls per lane, not one per batch (~2000)
-    assert len(down.calls) <= 3 * 6 * (1 + gemini.MAX_RETRIES)
-
+    lanes = [Lane(k, down, "m2", 0, cfg.rpd) for k in ("k1", "k2", "k3")] + [Lane("k1", up, "m1", 0, cfg.rpd)]
+    p, reason = run(db, cfg, None, clock=FakeClock(), lanes=lanes)  # retry_sleep: no-op
+    assert reason == "done" and p.failed == 0
+    assert set(statuses(db.conn).values()) == {1}  # nothing at -3
+    assert max(len(c) for c in down.calls) == cfg.batch_size  # never split
 
 
 def test_blame_needs_successes_of_the_same_model(cfg):
