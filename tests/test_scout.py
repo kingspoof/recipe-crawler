@@ -357,3 +357,15 @@ def test_link_counting_errors_never_affect_the_page(tmp_path, fake_http, monkeyp
     assert db.recipe_count() == 10
     assert dict(db.conn.execute("SELECT status, COUNT(*) FROM urls GROUP BY status")) == {"done": 10}
     db.close()
+
+
+def test_to_probe_refilters_against_the_current_config(tmp_path):
+    s = settings(tmp_path)
+    db = DB(s.db_path)
+    for host in ("www.added.de", "rejected.fr", "fresh.it"):
+        scout._upsert(db.conn, scout.bare(host), host, "wdc")
+    # config.toml changed after the candidates were collected
+    s.sites.append(Site("added.de", "DE", "de", "Europe"))
+    s.excluded.append(Excluded("www.rejected.fr", "blocked"))
+    assert [r["host"] for r in scout.to_probe(db, s, 10)] == ["fresh.it"]
+    db.close()
