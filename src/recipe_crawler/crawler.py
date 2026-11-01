@@ -88,7 +88,8 @@ class DomainWorker:
         self._robots[origin] = (robots, self.clock() + valid)
         if origin == _origin(self.site.base_url):
             self.robots = robots
-            self.robots_problem = problem
+            # only a problem if it is in effect (not when an older good copy is kept)
+            self.robots_problem = problem if robots.unreachable else None
         return robots
 
     async def allowed(self, url: str) -> bool:

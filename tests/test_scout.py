@@ -369,3 +369,33 @@ def test_to_probe_refilters_against_the_current_config(tmp_path):
     s.excluded.append(Excluded("www.rejected.fr", "blocked"))
     assert [r["host"] for r in scout.to_probe(db, s, 10)] == ["fresh.it"]
     db.close()
+
+
+def test_robots_problem_only_when_the_copy_in_use_is_unreachable(tmp_path, monkeypatch):
+    import recipe_crawler.crawler as crawler_mod
+    from recipe_crawler.crawler import DomainWorker
+    from recipe_crawler.net import Robots
+
+    answers = [(Robots(None, "t", allow_all=True), None), (Robots(None, "t"), "robots.txt returned HTTP 503")]
+
+    async def fake_fetch_robots(fetcher, origin):
+        return answers.pop(0)
+
+    monkeypatch.setattr(crawler_mod, "fetch_robots", fake_fetch_robots)
+    s = settings(tmp_path)
+    db = DB(":memory:")
+    c = Crawler(s, db)
+    w = DomainWorker(c, Site("www.newsite.de", "DE", "de", "Europe"))
+    now = [0.0]
+    w.clock = lambda: now[0]
+
+    async def go():
+        await w.robots_for(w.site.base_url)  # good copy
+        now[0] += 25 * 3600  # older than 24 h: fetched again, 503, the good copy is kept
+        r = await w.robots_for(w.site.base_url)
+        await c.fetcher.aclose()
+        return r
+
+    assert not asyncio.run(go()).unreachable
+    assert w.robots_problem is None
+    db.close()
