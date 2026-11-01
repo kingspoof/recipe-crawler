@@ -193,10 +193,7 @@ class LinkCollector:
             return
         rows, now = list(self.pending.items()), time.time()
         conn = self.db.conn
-        if conn.in_transaction:  # someone else's transaction: never commit or roll back their writes
-            log.warning("transaction already open; candidate links kept for the next try")
-            return
-        try:
+        try:  # inside someone else's transaction, transaction() raises without touching it: counts kept
             with transaction(conn):
                 conn.executemany(
                     """INSERT INTO candidate_links(host, from_domain, pages, first_seen, last_seen)
