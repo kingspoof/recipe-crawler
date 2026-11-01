@@ -341,3 +341,19 @@ def test_external_hosts_is_linear_on_hostile_pages():
         assert time.perf_counter() - start < 1.0
     attrs = 'class="x" ' + 'data-x="y" ' * 80  # long but normal attribute lists still match
     assert scout.external_hosts(f'<a {attrs}href="https://ok.com/">', "x.com") == {"ok.com"}
+
+
+def test_link_counting_errors_never_affect_the_page(tmp_path, fake_http, monkeypatch):
+    import recipe_crawler.crawler as crawler_mod
+
+    def boom(*a):
+        raise RuntimeError("link counting broke")
+
+    monkeypatch.setattr(crawler_mod, "external_hosts", boom)
+    s = settings(tmp_path)
+    s.sites = [Site("www.newsite.de", "DE", "de", "Europe")]
+    db = DB(s.db_path)
+    asyncio.run(Crawler(s, db).run(s.sites))
+    assert db.recipe_count() == 10
+    assert dict(db.conn.execute("SELECT status, COUNT(*) FROM urls GROUP BY status")) == {"done": 10}
+    db.close()
