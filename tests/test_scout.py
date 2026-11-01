@@ -410,3 +410,18 @@ def test_report_lists_a_final_host_once(tmp_path):
     assert lines == ['{ domain = "www.b.com", country = "", language = "en", region = "" },']
     assert "~900 URLs" in "\n".join(scout.report(db, s))  # the better entry is kept
     db.close()
+
+
+def test_probe_records_no_links(tmp_path, fake_http, monkeypatch):
+    import recipe_crawler.probe as probe_mod
+
+    made = []
+
+    class Spy(Crawler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            made.append(self)
+
+    monkeypatch.setattr(probe_mod, "Crawler", Spy)
+    asyncio.run(probe_site(settings(tmp_path), "www.newsite.de", samples=3, max_sitemaps=3))
+    assert made and made[0].links is None
