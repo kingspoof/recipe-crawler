@@ -514,6 +514,9 @@ def report(db, settings: Settings, limit: int = 50) -> list[str]:
         expected = (r["est_urls"] or 500) * (r["hit_rate"] or 0)  # links mode: size unknown, assume 500
         good.append((expected * weight, expected, r, g))
     good.sort(key=lambda t: t[0], reverse=True)
+    # a.com and b.com both redirecting to b.com: one line (host is the final host after the probe)
+    seen: set[str] = set()
+    good = [t for t in good if not (bare(t[2]["host"]) in seen or seen.add(bare(t[2]["host"])))]
     today = time.strftime("%Y-%m-%d")
     out = [
         f"# scout report {today}: {len(good)} candidate(s), best first (expected recipes x gap priority).",

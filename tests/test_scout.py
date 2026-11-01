@@ -399,3 +399,14 @@ def test_robots_problem_only_when_the_copy_in_use_is_unreachable(tmp_path, monke
     assert not asyncio.run(go()).unreachable
     assert w.robots_problem is None
     db.close()
+
+
+def test_report_lists_a_final_host_once(tmp_path):
+    s = settings(tmp_path)
+    db = DB(s.db_path)
+    for domain, est in (("a.com", 100), ("b.com", 900)):  # a.com redirects to www.b.com
+        scout._upsert(db.conn, domain, "www.b.com", "wdc", status="ok", hit_rate=1.0, est_urls=est, language="en")
+    lines = [ln for ln in scout.report(db, s) if ln.startswith("{ domain")]
+    assert lines == ['{ domain = "www.b.com", country = "", language = "en", region = "" },']
+    assert "~900 URLs" in "\n".join(scout.report(db, s))  # the better entry is kept
+    db.close()
