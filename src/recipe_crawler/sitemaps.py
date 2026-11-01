@@ -65,7 +65,7 @@ def parse_sitemap(body: bytes) -> tuple[list[str], list[str]]:
     Streams through the XML instead of building a tree, so a 50 MB sitemap needs little memory.
     CPU-heavy for big files: call it via asyncio.to_thread.
     """
-    body = _maybe_gunzip(body).lstrip()
+    body = _maybe_gunzip(body).lstrip().removeprefix(b"\xef\xbb\xbf").lstrip()  # UTF-8 BOM
     if not body.startswith(b"<"):
         # Plain-text sitemap: one URL per line.
         lines = body.decode("utf-8", "replace").splitlines()

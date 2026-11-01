@@ -5,92 +5,153 @@ Everything is persisted, so the crawler can be stopped (Ctrl+C) and resumed.
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import sqlite3
 import time
+import logging
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
+from . import schema
 from .config import Site
 from .extract import Recipe
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS urls (
-    url         TEXT PRIMARY KEY,
-    domain      TEXT NOT NULL,
-    -- pending | done | no_recipe | error | failed | blocked | gone
-    status      TEXT NOT NULL DEFAULT 'pending',
-    attempts    INTEGER NOT NULL DEFAULT 0,
-    http_status INTEGER,
-    error       TEXT,
-    updated_at  REAL
-);
-CREATE INDEX IF NOT EXISTS urls_domain_status ON urls(domain, status);
 
-CREATE TABLE IF NOT EXISTS domains (
-    domain        TEXT PRIMARY KEY,
-    discovered_at REAL,
-    sitemaps_read INTEGER,
-    urls_found    INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS recipes (
-    id             INTEGER PRIMARY KEY,  -- stable, referenced by recipe_ingredients.recipe_id
-    url            TEXT NOT NULL UNIQUE,
-    domain         TEXT NOT NULL,
-    site_country   TEXT,
-    site_region    TEXT,
-    language       TEXT,
-    name           TEXT NOT NULL,
-    description    TEXT,
-    ingredients    TEXT NOT NULL,  -- JSON list of strings
-    instructions   TEXT NOT NULL,  -- JSON list of strings
-    cuisine        TEXT,           -- JSON list
-    category       TEXT,           -- JSON list
-    keywords       TEXT,           -- JSON list
-    prep_time_min  INTEGER,
-    cook_time_min  INTEGER,
-    total_time_min INTEGER,
-    recipe_yield   TEXT,
-    image          TEXT,
-    author         TEXT,
-    date_published TEXT,
-    rating_value   REAL,
-    rating_count   INTEGER,
-    nutrition      TEXT,           -- JSON object
-    raw            TEXT,           -- original JSON-LD node
-    crawled_at     REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS recipes_domain ON recipes(domain);
-"""
-
+EXPORT_COLUMNS = (
+    "url, domain, site_country, site_region, language, name, description, ingredients, instructions, cuisine, "
+    "category, keywords, prep_time_min, cook_time_min, total_time_min, recipe_yield, image, author, "
+    "date_published, rating_value, rating_count, nutrition, crawled_at"
+)
 _JSON_FIELDS = ("ingredients", "instructions", "cuisine", "category", "keywords", "nutrition")
+
+# Seconds a connection waits for another one's write lock. `map` and `crawl` run at the same time, and a
+# `map` chunk or a big `add_urls` can hold the lock for a few seconds.
+BUSY_TIMEOUT = 60.0
+JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection, immediate: bool = True) -> Iterator[None]:
+    """One transaction on an autocommit connection; rolled back on any error, so the connection never stays
+    inside a half-done transaction (which would silently swallow every later write until it is closed).
+
+    immediate: take the write lock right away (BEGIN IMMEDIATE). A deferred BEGIN that reads first and writes
+    later fails with SQLITE_BUSY at the first write if another connection committed in between, and the busy
+    timeout does not help there.
+    """
+    if conn.in_transaction:
+        raise RuntimeError("transaction() does not nest: a transaction is already open")
+    conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+    try:
+        yield
+    except BaseException:
+        if conn.in_transaction:  # some errors (e.g. SQLITE_FULL) already rolled back
+            conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+log = logging.getLogger("db")
+
+
+class Busy(SystemExit):
+    pass
+
+
+def lock_file(path: Path, exclusive: bool, wait: bool = False) -> int:
+    """flock on `path` (created if missing); returns the fd, which holds the lock until closed."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        os.close(fd)
+        raise Busy(f"{path} is locked by another recipe-crawler process") from None
+    return fd
+
+
+def single_instance(db_path: Path, name: str) -> int:
+    """At most one `crawl`, one `process`, ... per database at a time (two `process` runs would each think
+    they have the whole quota). Returns the lock's fd: keep it open for the whole command."""
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        return lock_file(Path(f"{db_path}.{name}.lock"), exclusive=True)
+    except Busy:
+        raise Busy(f"another `recipe-crawler {name}` is already running on {db_path}") from None
 
 
 class DB:
-    def __init__(self, path: Path):
-        if str(path) != ":memory:":
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    """readonly: for commands that only read (stats, export, dry runs). Opened with mode=ro, so nothing, not even
+    a migration, can write; a missing database is an error instead of an empty new file.
+
+    Otherwise the schema is migrated to the current version on open (schema.py); `backup` is called first if
+    a migration needs a full backup."""
+
+    def __init__(self, path: Path, timeout: float = BUSY_TIMEOUT, readonly: bool = False,
+                 backup: Callable[[], object] | None = None):
+        memory = str(path) == ":memory:"
+        if readonly and not memory:
+            if not Path(path).exists():
+                raise SystemExit(f"No database at {path}: run `recipe-crawler crawl` first.")
+            self.conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True,
+                                        isolation_level=None, check_same_thread=False, timeout=timeout)
+        else:
+            if not memory:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=timeout)
         self.conn.row_factory = sqlite3.Row
+        self._lock_fd: int | None = None
+        if readonly:
+            v = schema.version(self.conn)
+            if v != schema.CURRENT:
+                log.warning("database is at schema version %d, this code at %d: a write command migrates it",
+                            v, schema.CURRENT)
+            return
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.executescript(SCHEMA)
+        # After a checkpoint, the -wal file is truncated to this size instead of keeping its peak size
+        # (`map --full` used to leave GBs behind).
+        self.conn.execute(f"PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT}")
+        if memory:
+            schema.migrate(self.conn, backup)
+            return
+        # Every writing process holds a shared lock on recipes.db.lock; a migration needs it exclusively, so
+        # it never changes the schema under a running `crawl` that still uses the old one.
+        lock = Path(f"{path}.lock")
+        if schema.pending(self.conn):
+            try:
+                self._lock_fd = lock_file(lock, exclusive=True)
+            except Busy:
+                self.conn.close()
+                raise Busy(f"The database needs a schema migration (to version {schema.CURRENT}), but another "
+                           "recipe-crawler process is using it: stop it, then run this again.") from None
+            try:
+                schema.migrate(self.conn, backup)
+            except BaseException:
+                self.close()
+                raise
+            fcntl.flock(self._lock_fd, fcntl.LOCK_SH)  # downgrade: other commands may start now
+        else:
+            self._lock_fd = lock_file(lock, exclusive=False, wait=True)  # waits only for a running migration
 
     def close(self) -> None:
         self.conn.close()
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
 
     # ------------------------------------------------------------------ frontier
 
     def add_urls(self, domain: str, urls: Iterable[str]) -> int:
         now = time.time()
         before = self.conn.total_changes
-        self.conn.execute("BEGIN")
-        self.conn.executemany(
-            "INSERT OR IGNORE INTO urls(url, domain, updated_at) VALUES (?, ?, ?)",
-            ((u, domain, now) for u in urls),
-        )
-        self.conn.execute("COMMIT")
+        with transaction(self.conn):
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO urls(url, domain, updated_at) VALUES (?, ?, ?)",
+                ((u, domain, now) for u in urls),
+            )
         return self.conn.total_changes - before
 
     def next_batch(self, domain: str, limit: int, max_attempts: int) -> list[str]:
@@ -117,17 +178,31 @@ class DB:
                 (status, http_status, error, time.time(), url),
             )
 
-    def is_discovered(self, domain: str) -> bool:
+    def is_discovered(self, domain: str, max_age_days: float = 0) -> bool:
+        """True if the sitemaps were read completely, and (max_age_days > 0) not longer ago than that."""
         row = self.conn.execute("SELECT discovered_at FROM domains WHERE domain = ?", (domain,)).fetchone()
-        return bool(row and row["discovered_at"])
+        if not (row and row["discovered_at"]):
+            return False
+        return max_age_days <= 0 or row["discovered_at"] > time.time() - max_age_days * 86400
 
     def set_discovered(self, domain: str, sitemaps_read: int, urls_found: int) -> None:
         self.conn.execute(
             """INSERT INTO domains(domain, discovered_at, sitemaps_read, urls_found) VALUES (?, ?, ?, ?)
                ON CONFLICT(domain) DO UPDATE SET discovered_at = excluded.discovered_at,
-               sitemaps_read = excluded.sitemaps_read, urls_found = excluded.urls_found""",
+               sitemaps_read = excluded.sitemaps_read, urls_found = excluded.urls_found,
+               incomplete_discoveries = 0""",
             (domain, time.time(), sitemaps_read, urls_found),
         )
+
+    def discovery_incomplete(self, domain: str) -> int:
+        """Counts a discovery run in which some sitemap failed; returns how many in a row (discovered_at stays)."""
+        self.conn.execute(
+            """INSERT INTO domains(domain, incomplete_discoveries) VALUES (?, 1)
+               ON CONFLICT(domain) DO UPDATE SET incomplete_discoveries = incomplete_discoveries + 1""",
+            (domain,),
+        )
+        return self.conn.execute("SELECT incomplete_discoveries FROM domains WHERE domain = ?",
+                                 (domain,)).fetchone()[0]
 
     def reset_discovery(self, domain: str) -> None:
         self.conn.execute("DELETE FROM domains WHERE domain = ?", (domain,))
@@ -171,9 +246,9 @@ class DB:
         return dict(self.conn.execute("SELECT site_region, COUNT(*) FROM recipes GROUP BY site_region"))
 
     def iter_recipes(self, include_raw: bool = False) -> Iterator[dict[str, Any]]:
-        cols = "*" if include_raw else "url, domain, site_country, site_region, language, name, description, ingredients, " \
-            "instructions, cuisine, category, keywords, prep_time_min, cook_time_min, total_time_min, " \
-            "recipe_yield, image, author, date_published, rating_value, rating_count, nutrition, crawled_at"
+        # Listed, not "*": the real table still has legacy columns from earlier versions, which must not end up
+        # in the export.
+        cols = EXPORT_COLUMNS + (", raw" if include_raw else "")
         for row in self.conn.execute(f"SELECT {cols} FROM recipes ORDER BY id"):
             d = dict(row)
             for f in _JSON_FIELDS + (("raw",) if include_raw else ()):

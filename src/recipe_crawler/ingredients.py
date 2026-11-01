@@ -7,7 +7,8 @@
 
 Tables (all created / migrated here, additively, on the first write command):
 - ingredient_lines: notebook schema + `original` (nullable).
-  status 0 = to do, 1 = done, -1 = model left it out max_attempts times, -2 = skipped (too long).
+  status 0 = to do, 1 = done, -1 = model left it out max_attempts times, -2 = skipped (too long),
+  -3 = gave up after repeated server errors on this line alone (safe to reset to 0).
   items: JSON [[name, amount, unit], ...] exactly as the model returned them; cleanup happens in `map`.
 - recipe_ingredients: notebook schema, recipe_id = recipes.id.
 - recipe_ingredients_state: one row per mapped recipe: when it was mapped and how many of its lines were still
@@ -23,80 +24,24 @@ import logging
 import sqlite3
 import time
 from collections import Counter
-from contextlib import contextmanager
-from typing import Iterator
-
+from typing import Callable
 from .config import IngredientSettings
-from .gemini import Line, UsageLog, fingerprint, next_reset, quota_day
+from . import schema
+from .db import transaction as _tx
+from .schema import RECIPE_INGREDIENTS
+from .schema import columns as _columns
+from .schema import has_table as _has_table
+from .gemini import (GAVE_UP, PROMPT, Client, GeminiClient, Lane, Line, UsageLog, fingerprint, next_reset, quota_day,
+                     spool_read)
 
 log = logging.getLogger("ingredients")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS ingredient_lines (
-    id INTEGER PRIMARY KEY,
-    line TEXT NOT NULL UNIQUE,
-    n INTEGER NOT NULL,
-    status INTEGER NOT NULL DEFAULT 0,
-    items TEXT,
-    model TEXT,
-    done_at REAL
-);
-CREATE INDEX IF NOT EXISTS ingredient_lines_todo ON ingredient_lines(status, n DESC);
-
-CREATE TABLE IF NOT EXISTS ingredient_names (
-    name TEXT PRIMARY KEY,
-    canonical TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS recipe_ingredients_state (
-    recipe_id INTEGER PRIMARY KEY,  -- recipes.id
-    mapped_at REAL NOT NULL,
-    pending INTEGER NOT NULL        -- lines of the recipe that were not done yet when it was mapped
-);
-"""
-
-RECIPE_INGREDIENTS = """
-CREATE TABLE IF NOT EXISTS recipe_ingredients (
-    recipe_id INTEGER NOT NULL,  -- recipes.id
-    pos INTEGER NOT NULL,        -- position of the line in the recipe
-    line_id INTEGER NOT NULL,    -- ingredient_lines.id
-    name TEXT NOT NULL,
-    amount REAL,
-    unit TEXT
-);
-"""
-RECIPE_INGREDIENTS_INDEXES = """
-CREATE INDEX IF NOT EXISTS recipe_ingredients_recipe ON recipe_ingredients(recipe_id);
-CREATE INDEX IF NOT EXISTS recipe_ingredients_name ON recipe_ingredients(name);
-"""
+FULL_CHUNK = 5000  # recipes per transaction in `map --full`: the write lock is held for a moment at a time
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Additive and idempotent: never drops anything, never touches done lines."""
-    conn.executescript(SCHEMA + RECIPE_INGREDIENTS + RECIPE_INGREDIENTS_INDEXES)
-    if "original" not in _columns(conn, "ingredient_lines"):
-        conn.execute("ALTER TABLE ingredient_lines ADD COLUMN original TEXT")  # schema only, instant on 2M rows
-        log.info("migration: added ingredient_lines.original")
-
-
-def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-
-
-def _has_table(conn: sqlite3.Connection, table: str) -> bool:
-    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
-
-
-@contextmanager
-def _tx(conn: sqlite3.Connection) -> Iterator[None]:
-    """One transaction (DB opens the connection in autocommit mode)."""
-    conn.execute("BEGIN")
-    try:
-        yield
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    conn.execute("COMMIT")
+    """Migrates to the current schema version (DB() already does this for write commands). See schema.py."""
+    schema.migrate(conn)
 
 
 def _spelling(line: object) -> str:
@@ -109,6 +54,9 @@ def norm(line: object) -> str:
 
 
 # --------------------------------------------------------------------------- step 1: lines
+
+
+LINES_CHUNK = 50_000  # upserts per transaction in `lines`
 
 
 def collect_lines(conn: sqlite3.Connection, cfg: IngredientSettings) -> None:
@@ -138,12 +86,14 @@ def collect_lines(conn: sqlite3.Connection, cfg: IngredientSettings) -> None:
         b = best.get(key)
         rows.append((key, n, b[1] if b and b[0] > n - other[key] else None))  # beats the lowercase spelling
     del counts, best, other
+    for i in range(0, len(rows), LINES_CHUNK):  # short transactions: `crawl` keeps writing in between
+        with _tx(conn):
+            conn.executemany(
+                """INSERT INTO ingredient_lines (line, n, original) VALUES (?, ?, ?)
+                   ON CONFLICT(line) DO UPDATE SET n = excluded.n, original = excluded.original""",
+                rows[i:i + LINES_CHUNK],
+            )
     with _tx(conn):
-        conn.executemany(
-            """INSERT INTO ingredient_lines (line, n, original) VALUES (?, ?, ?)
-               ON CONFLICT(line) DO UPDATE SET n = excluded.n, original = excluded.original""",
-            rows,
-        )
         conn.execute("UPDATE ingredient_lines SET status = -2 WHERE status = 0 AND length(line) > ?",
                      (cfg.max_line_chars,))
     log.info("%s distinct lines in %.0f s", f"{len(rows):,}", time.time() - t)
@@ -161,8 +111,14 @@ def todo_lines(conn: sqlite3.Connection) -> list[Line]:
         f"SELECT id, {text} FROM ingredient_lines WHERE status = 0 ORDER BY n DESC")]
 
 
+SAVE_BUSY_TIMEOUT_MS = 10_000  # per save try (3 tries): a stop must not wait minutes for a locked database
+
+
 def make_save(conn: sqlite3.Connection):
-    def save(answered: list[tuple[int, list]], failed: list[int], model: str) -> None:
+    """The `process` connection only saves answers, so its busy timeout is shortened here."""
+    conn.execute(f"PRAGMA busy_timeout = {SAVE_BUSY_TIMEOUT_MS}")
+
+    def save(answered: list[tuple[int, list]], failed: list[int], model: str, gave_up: list[int] = ()) -> None:  # type: ignore[assignment]
         now = time.time()
         with _tx(conn):
             conn.executemany(
@@ -170,7 +126,56 @@ def make_save(conn: sqlite3.Connection):
                 [(json.dumps(items, ensure_ascii=False), model, now, id) for id, items in answered],
             )
             conn.executemany("UPDATE ingredient_lines SET status = -1 WHERE id = ?", [(id,) for id in failed])
+            conn.executemany(f"UPDATE ingredient_lines SET status = {GAVE_UP} WHERE id = ?", [(id,) for id in gave_up])
     return save
+
+
+def build_lanes(cfg: IngredientSettings, keys: list[str], usage: UsageLog, used: Counter[tuple[str, str]],
+                client: Callable[[str], Client] = GeminiClient) -> list[Lane]:
+    """One lane per key x model, with today's usage; lanes that got a 429 PerDay today start exhausted."""
+    lanes = [Lane(k, client(k), m, used[fingerprint(k), m], cfg.rpd) for m in cfg.models for k in keys]
+    for lane in lanes:
+        lane.exhausted = (lane.key, lane.model) in usage.exhausted
+    return lanes
+
+
+def dry_run(conn: sqlite3.Connection, cfg: IngredientSettings, keys: list[str], used: Counter[tuple[str, str]],
+            show_prompt: bool = False) -> list[str]:
+    """What `process` would send. Reads only: no migrations, no requests, no usage records."""
+    if not _has_table(conn, "ingredient_lines"):
+        raise SystemExit("No ingredient_lines table yet: run `recipe-crawler lines` first.")
+    todo = todo_lines(conn)
+    out = [f"{len(todo):,} lines to do = {-(-len(todo) // cfg.batch_size):,} requests of {cfg.batch_size}"]
+    for k in keys:
+        for m in cfg.models:
+            out.append(f"  lane {fingerprint(k)}/{m}: {used[fingerprint(k), m]}/{cfg.rpd or '-'} used today")
+    first = [line.text for line in todo[:cfg.batch_size]]
+    out.append(f"first request ({len(first)} lines, prompt {len(PROMPT):,} chars):")
+    out += [f"  [{i}, {json.dumps(text, ensure_ascii=False)}]" for i, text in enumerate(first[:20])]
+    if len(first) > 20:
+        out.append(f"  ... {len(first) - 20} more")
+    if show_prompt:
+        out.append(PROMPT)
+    return out
+
+
+def spool_path(cfg: IngredientSettings):
+    return cfg.usage_log.parent / "unsaved_answers.jsonl"
+
+
+def apply_spool(conn: sqlite3.Connection, cfg: IngredientSettings) -> int:
+    """Saves the answers a previous `process` could not write to the database, then removes the file."""
+    path = spool_path(cfg)
+    records = spool_read(path)
+    if not records and not path.exists():
+        return 0
+    save = make_save(conn)
+    for answered, failed, model, gave_up in records:
+        save(answered, failed, model, gave_up)
+    path.unlink()
+    n = sum(len(r[0]) for r in records)
+    log.info("applied %s answers from %s", f"{n:,}", path)
+    return n
 
 
 # --------------------------------------------------------------------------- step 3: map
@@ -232,40 +237,59 @@ def map_ingredients(conn: sqlite3.Connection, cfg: IngredientSettings, full: boo
 
     insert = "INSERT INTO recipe_ingredients VALUES (?, ?, ?, ?, ?, ?)"
     insert_state = "INSERT OR REPLACE INTO recipe_ingredients_state VALUES (?, ?, ?)"
-    with _tx(conn):
-        if full:
-            done = {line: (id, json.loads(items), done_at or 0) for id, line, items, done_at in conn.execute(
-                "SELECT id, line, items, done_at FROM ingredient_lines WHERE status = 1")}
-            conn.execute("DROP TABLE IF EXISTS recipe_ingredients")
-            conn.execute(RECIPE_INGREDIENTS)
-            conn.execute("DELETE FROM recipe_ingredients_state")
-            rows, states = [], []
-            for recipe_id, ingredients in conn.execute("SELECT id, ingredients FROM recipes"):
-                r, pending = rows_for(recipe_id, [norm(x) for x in json.loads(ingredients)], done)
-                rows += r
-                states.append((recipe_id, started, pending))
-                stats["recipes"] += 1
-                stats["complete"] += pending == 0
-                if len(rows) > 200_000:
-                    conn.executemany(insert, rows)
-                    stats["rows"] += len(rows)
-                    rows = []
-            conn.executemany(insert, rows)
-            conn.executemany(insert_state, states)
-            stats["rows"] += len(rows)
-            stats["rebuilt"] = stats["recipes"]
-            del done, states
-            for statement in RECIPE_INGREDIENTS_INDEXES.strip().split(";")[:-1]:  # no executescript: it commits
-                conn.execute(statement)
-        else:
-            candidates = conn.execute(
-                """SELECT r.id, s.mapped_at FROM recipes r LEFT JOIN recipe_ingredients_state s ON s.recipe_id = r.id
-                   WHERE s.recipe_id IS NULL OR s.pending > 0""").fetchall()
-            for i in range(0, len(candidates), 1000):
+    if full:
+        _map_full(conn, rows_for, started, stats)
+    else:
+        candidates = conn.execute(
+            """SELECT r.id, s.mapped_at FROM recipes r LEFT JOIN recipe_ingredients_state s ON s.recipe_id = r.id
+               WHERE s.recipe_id IS NULL OR s.pending > 0""").fetchall()
+        for i in range(0, len(candidates), 1000):
+            with _tx(conn):  # one transaction per chunk: `crawl` and `process` can write in between
                 _map_chunk(conn, candidates[i:i + 1000], rows_for, started, stats, insert, insert_state)
     log.info("%s rows for %s rebuilt recipes in %.0f s (%s recipes checked)", f"{stats['rows']:,}",
              f"{stats['rebuilt']:,}", time.time() - started, f"{stats['recipes']:,}")
     return dict(stats)
+
+
+def _map_full(conn, rows_for, started, stats) -> None:
+    """Builds recipe_ingredients_new (+ state) chunk by chunk, then swaps both in with one short transaction.
+    Until the swap, readers see the old table; a crash leaves the old table untouched."""
+    done = {line: (id, json.loads(items), done_at or 0) for id, line, items, done_at in conn.execute(
+        "SELECT id, line, items, done_at FROM ingredient_lines WHERE status = 1")}
+    suffix = time.time_ns()  # index names must be unique while the old table still exists
+    with _tx(conn):
+        conn.execute("DROP TABLE IF EXISTS recipe_ingredients_new")  # left over from a crashed run
+        conn.execute("DROP TABLE IF EXISTS recipe_ingredients_state_new")
+        conn.execute(RECIPE_INGREDIENTS.replace("IF NOT EXISTS recipe_ingredients", "recipe_ingredients_new"))
+        conn.execute("CREATE TABLE recipe_ingredients_state_new "
+                     "(recipe_id INTEGER PRIMARY KEY, mapped_at REAL NOT NULL, pending INTEGER NOT NULL)")
+        # Indexes first, so each chunk keeps them up to date (no minute-long CREATE INDEX holding the lock).
+        conn.execute(f"CREATE INDEX recipe_ingredients_recipe_{suffix} ON recipe_ingredients_new(recipe_id)")
+        conn.execute(f"CREATE INDEX recipe_ingredients_name_{suffix} ON recipe_ingredients_new(name)")
+    last = -1
+    while True:
+        chunk = conn.execute("SELECT id, ingredients FROM recipes WHERE id > ? ORDER BY id LIMIT ?",
+                             (last, FULL_CHUNK)).fetchall()
+        if not chunk:
+            break
+        last = chunk[-1][0]
+        rows, states = [], []
+        for recipe_id, ingredients in chunk:
+            r, pending = rows_for(recipe_id, [norm(x) for x in json.loads(ingredients)], done)
+            rows += r
+            states.append((recipe_id, started, pending))
+            stats["complete"] += pending == 0
+        with _tx(conn):
+            conn.executemany("INSERT INTO recipe_ingredients_new VALUES (?, ?, ?, ?, ?, ?)", rows)
+            conn.executemany("INSERT INTO recipe_ingredients_state_new VALUES (?, ?, ?)", states)
+        stats["recipes"] += len(chunk)
+        stats["rows"] += len(rows)
+    stats["rebuilt"] = stats["recipes"]
+    with _tx(conn):
+        conn.execute("DROP TABLE recipe_ingredients")
+        conn.execute("DROP TABLE recipe_ingredients_state")
+        conn.execute("ALTER TABLE recipe_ingredients_new RENAME TO recipe_ingredients")
+        conn.execute("ALTER TABLE recipe_ingredients_state_new RENAME TO recipe_ingredients_state")
 
 
 def _map_chunk(conn, chunk, rows_for, started, stats, insert, insert_state) -> None:
@@ -301,7 +325,8 @@ def _map_chunk(conn, chunk, rows_for, started, stats, insert, insert_state) -> N
 
 def names_report(conn: sqlite3.Connection) -> list[str]:
     """Stub of the name standardization step: shows what there is to merge. Merging itself is not built yet."""
-    ensure_schema(conn)
+    if not _has_table(conn, "recipe_ingredients"):
+        return ["no recipe_ingredients yet: run `recipe-crawler map`"]
     distinct, rows = conn.execute("SELECT COUNT(DISTINCT name), COUNT(*) FROM recipe_ingredients").fetchone()
     mapped = conn.execute("SELECT COUNT(*) FROM ingredient_names").fetchone()[0]
     top = conn.execute("SELECT name, COUNT(*) FROM recipe_ingredients GROUP BY 1 ORDER BY 2 DESC LIMIT 20").fetchall()
@@ -325,7 +350,8 @@ def progress(conn: sqlite3.Connection) -> list[str]:
     all_lines = max(sum(c for c, _ in rows.values()), 1)
     all_uses = max(sum(n for _, n in rows.values()), 1)
     out = []
-    for status, name in [(1, "done"), (0, "to do"), (-1, "failed"), (-2, "skipped (too long)")]:
+    for status, name in [(1, "done"), (0, "to do"), (-1, "failed"), (GAVE_UP, "gave up (server errors)"),
+                         (-2, "skipped (too long)")]:
         c, n = rows.get(status, (0, 0))
         out.append(f"{name:20} {c:>10,} distinct lines ({c / all_lines:6.1%})   "
                    f"covering {n:>10,} recipe lines ({n / all_uses:6.1%})")

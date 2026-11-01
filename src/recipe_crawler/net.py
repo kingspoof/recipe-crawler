@@ -63,6 +63,9 @@ class Response:
 class Fetcher:
     def __init__(self, user_agent: str, timeout: float):
         self.user_agent = user_agent
+        # httpx's timeout applies to each read, so a server that trickles bytes could hold a worker forever.
+        # This limits the whole request; sitemaps (up to 60 MB) get longer.
+        self.total_timeout = 2 * timeout
         # Token used to match robots.txt "User-agent:" groups, e.g. "RecipeResearchCrawler".
         self.robots_token = user_agent.split("/")[0].split(" ")[0]
         self.client = httpx.AsyncClient(
@@ -71,13 +74,21 @@ class Fetcher:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
             timeout=httpx.Timeout(timeout, connect=15.0),
-            follow_redirects=True,
+            follow_redirects=False,  # DomainWorker follows them itself, checking robots.txt for every hop
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
         )
 
-    async def get(self, url: str, max_bytes: int = MAX_PAGE_BYTES) -> Response:
+    async def get(self, url: str, max_bytes: int = MAX_PAGE_BYTES, follow_redirects: bool = False) -> Response:
         start = time.monotonic()
-        async with self.client.stream("GET", url) as r:
+        total = self.total_timeout * (5 if max_bytes > MAX_PAGE_BYTES else 1)
+        try:
+            async with asyncio.timeout(total):
+                return await self._get(url, max_bytes, follow_redirects, start)
+        except TimeoutError:
+            raise httpx.ReadTimeout(f"no complete response after {total:.0f} s") from None
+
+    async def _get(self, url: str, max_bytes: int, follow_redirects: bool, start: float) -> Response:
+        async with self.client.stream("GET", url, follow_redirects=follow_redirects) as r:
             declared = r.headers.get("content-length")
             if declared and declared.isdigit() and int(declared) > max_bytes:
                 raise TooLarge(f"{declared} bytes")
@@ -103,10 +114,18 @@ class Throttle:
         self.delay = delay
         self._next = 0.0
 
-    async def wait(self) -> None:
+    async def wait(self, stop: asyncio.Event | None = None) -> None:
+        """Sleeps until the next request may start; returns early when `stop` is set."""
         now = time.monotonic()
-        if now < self._next:
+        if now >= self._next:
+            return
+        if stop is None:
             await asyncio.sleep(self._next - now)
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), self._next - now)
+        except TimeoutError:
+            pass
 
     def done(self, elapsed: float = 0.0) -> None:
         # If the server is slow, slow down too.
@@ -154,7 +173,8 @@ class Robots:
 async def fetch_robots(fetcher: Fetcher, base_url: str) -> tuple[Robots, str | None]:
     """Fetch robots.txt following RFC 9309: 4xx = allow all, 5xx/network error = disallow all."""
     try:
-        r = await fetcher.get(f"{base_url}/robots.txt", max_bytes=2 * 1024 * 1024)
+        # RFC 9309: follow at least five redirects for robots.txt itself
+        r = await fetcher.get(f"{base_url}/robots.txt", max_bytes=2 * 1024 * 1024, follow_redirects=True)
     except (httpx.HTTPError, TooLarge) as e:
         return Robots(None, fetcher.robots_token), f"robots.txt unreachable: {type(e).__name__}: {e}"
     if r.status >= 500 or r.status == 429:

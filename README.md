@@ -55,13 +55,63 @@ uv run recipe-crawler --log-file data.nosync/ingredients.log process   # log to 
   `stagger` seconds apart; a short-term 429 pauses a lane for 2, 4, 8 … 30 min, a per-day 429 ends it for today.
 - **Stopping**: Ctrl+C / SIGTERM stops sending, waits for the requests in flight and saves them; a second
   Ctrl+C aborts. Every answer is saved right away, so restarting is always safe.
+- **Server and network errors** are never counted against the lines. A network error (no answer) pauses the
+  lane for 2, 4, 8 … 30 min. A 5xx pauses the lane too, unless other requests of the same model succeed in
+  between: then the batch itself is the problem and is split in halves, down to single lines. A single line that
+  still fails twice that way gets **status -3** ("gave up (server errors)" in `stats`). It is safe to retry:
+  `sqlite3 data.nosync/recipes.db "UPDATE ingredient_lines SET status = 0 WHERE status = -3;"`
+  (status -1 = the model left the line out twice; reset it the same way to try again).
+- **Database errors**: a failed save is retried 3 times (10 s busy timeout each); if the database still can't be
+  written (locked, disk full), the answers go to `data.nosync/unsaved_answers.jsonl`, no new requests are sent,
+  later answers go straight to that file, and the next `process` saves them first. So if `process` stops with
+  "database not writable" after about half a minute, nothing is lost: find what held the lock (`map --full`,
+  `sqlite3` left open in a transaction, a full disk) and run `process` again.
 - `names` is a stub for the next step (merging names like "cilantro" / "coriander" via `ingredient_names`).
+
+## Database safety
+
+`recipes.db` holds weeks of crawling and the Gemini answers paid for with quota. Set `[backup] dir` in
+`config.toml` to a folder **outside iCloud** (ideally another disk) first; `backup` refuses to run without it.
+
+```bash
+uv run recipe-crawler backup          # daily: ingredient_lines, ingredient_names, domains (gzipped, small)
+                                      #   + a full backup when the newest is older than 7 days
+uv run recipe-crawler backup --full   # full backup now
+uv run recipe-crawler check           # quick_check of the newest backups; exit 1 if broken or too old
+```
+
+- Both kinds are safe while `crawl` / `process` / `map` run (one consistent snapshot, written to `*.partial`,
+  checked with `quick_check`, then renamed). Retention: 14 daily; full: the newest 2 plus the newest of each of
+  the last 4 weeks. `backup` ends with a WAL checkpoint, so the `-wal` file shrinks back.
+- Exclude the live database from Time Machine (a copy taken mid-write can be torn):
+  `tmutil addexclusion -p "$PWD/data.nosync"` (and keep the backup folder included).
+- **Restore a full backup**: stop every `recipe-crawler` process, move `recipes.db`, `recipes.db-wal` and
+  `recipes.db-shm` aside, copy the backup to `data.nosync/recipes.db`.
+- **Restore the daily tables** (e.g. `ingredient_lines` after a bad edit): `gunzip -k daily-….db.gz`, then in
+  `sqlite3 data.nosync/recipes.db`: `ATTACH 'daily-….db' AS b; BEGIN; DELETE FROM ingredient_lines;
+  INSERT INTO ingredient_lines (id, line, n, status, items, model, done_at, original)
+  SELECT id, line, n, status, items, model, done_at, original FROM b.ingredient_lines; COMMIT;`
+  Always name the columns: a backup from an older schema can have fewer (e.g. `domains` before schema v2 has no
+  `incomplete_discoveries`), so for `domains` use
+  `INSERT INTO domains (domain, discovered_at, sitemaps_read, urls_found) SELECT domain, discovered_at,
+  sitemaps_read, urls_found FROM b.domains;`
+- **Schema versions** live in `src/recipe_crawler/schema.py` (`PRAGMA user_version`). A migration runs on the
+  first write command after an update, takes a full backup first when it changes data, and refuses to run while
+  another `recipe-crawler` process uses the database. Read-only commands (`stats`, `export`, `names`,
+  `process --dry-run`) open the database read-only and never migrate. Code from this version on refuses a
+  database with a newer schema; older checkouts (before schema versioning) do not check, so don't run them
+  against a migrated database.
+- Only one `crawl`, `process`, `map`, `lines` or `backup` runs at a time per database.
+- **Don't**: `cp` the database while anything runs, delete `-wal` / `-shm` files while anything runs, `VACUUM`
+  during a crawl, or `DROP COLUMN` (rewrites all 7 GB).
 
 ## How it works
 
-1. **robots.txt**: fetched per site and obeyed (including `Crawl-delay`). Sites that return 401/403 for
+1. **robots.txt**: fetched per host, refreshed after 24 h and obeyed (including `Crawl-delay`); redirects are
+   followed only if the target's robots.txt allows it. Sites that return 401/403 for
    robots.txt are treated as "bots not welcome" and skipped.
-2. **Discovery**: reads the site's sitemaps. If a sitemap index has recipe-named children
+2. **Discovery**: reads the site's sitemaps (again after `rediscover_after_days`, and on the next run if a
+   sitemap failed). If a sitemap index has recipe-named children
    (`recipe-sitemap.xml`, `receita-sitemap.xml`, `/recepti/…`) only those are followed. For sites without
    recipe sitemaps, `follow_links = true` mode follows links whose URL matches `url_pattern`.
 3. **Crawling**: one sequential worker per site with ≥2 s between requests. It slows down when the

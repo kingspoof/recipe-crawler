@@ -18,19 +18,23 @@ import hashlib
 import json
 import logging
 import os
-import random
 import signal
 import sys
 from collections import Counter
 from urllib.parse import urlsplit
 
-from . import gemini, ingredients
+from . import backup, gemini, ingredients
 from .config import Settings, Site, load_config
-from .crawler import Crawler, DomainWorker
-from .db import DB
-from .extract import extract_links, extract_recipes
-from .net import MAX_SITEMAP_BYTES
-from .sitemaps import FALLBACK_SITEMAPS, iter_sitemaps, select_sitemaps, keep_page_url
+from .crawler import Crawler
+from .db import DB, single_instance
+from .probe import probe_site
+
+
+def open_db(settings: Settings) -> DB:
+    """For write commands: migrates the schema if needed, with a full backup first when a migration asks for
+    one (refused if [backup] dir is not set)."""
+    take = (lambda: backup.full(settings.db_path, settings.backup)) if settings.backup.dir else None
+    return DB(settings.db_path, backup=take)
 
 
 def _selected_sites(settings: Settings, domains: list[str] | None) -> list[Site]:
@@ -45,7 +49,7 @@ def _selected_sites(settings: Settings, domains: list[str] | None) -> list[Site]
 def cmd_crawl(settings: Settings, args: argparse.Namespace, discover_only: bool = False) -> None:
     if args.target:
         settings.target_total = args.target
-    db = DB(settings.db_path)
+    db = open_db(settings)
     crawler = Crawler(settings, db)
     sites = _selected_sites(settings, args.domain)
 
@@ -69,89 +73,13 @@ def cmd_crawl(settings: Settings, args: argparse.Namespace, discover_only: bool 
 # --------------------------------------------------------------------------- probe
 
 
-async def _probe(settings: Settings, domain: str, samples: int, max_sitemaps: int) -> dict:
-    try:
-        site = settings.site(domain)
-    except KeyError:
-        site = Site(domain=domain, country="", language="")
-    db = DB(":memory:")  # type: ignore[arg-type]
-    crawler = Crawler(settings, db)
-    w = DomainWorker(crawler, site)
-    w.throttle.base_delay = w.throttle.delay = min(w.throttle.delay, 1.0)
-    report: dict = {"domain": domain, "ok": False}
-    try:
-        if not await w.setup():
-            report["problem"] = "robots.txt unreachable (5xx / network error / blocked)"
-            return report
-        robots = w.robots
-        assert robots is not None
-        report["robots_sitemaps"] = robots.sitemaps
-        report["crawl_delay"] = robots.crawl_delay
-        if not robots.allowed(site.base_url + "/"):
-            report["problem"] = "robots.txt disallows our user agent for the whole site"
-            return report
-        roots = site.sitemaps or select_sitemaps(site, robots.sitemaps) or [
-            site.base_url + p for p in FALLBACK_SITEMAPS
-        ]
-
-        async def fetch(url):
-            return await w._get(url, MAX_SITEMAP_BYTES) if robots.allowed(url) else None
-
-        sitemaps_seen: list[tuple[str, int]] = []
-        urls: list[str] = []
-        async for sm, found in iter_sitemaps(site, roots, fetch, max_sitemaps=max_sitemaps):
-            sitemaps_seen.append((sm, len(found)))
-            urls.extend(u for u in found if robots.allowed(u))
-        report["sitemaps_sampled"] = sitemaps_seen
-        report["urls_in_sampled_sitemaps"] = len(urls)
-        if not urls:
-            # No usable sitemap: sample links from the start page instead.
-            report["mode"] = "links"
-            for start in site.start_urls or [site.base_url + "/"]:
-                r = await w._get(start)
-                if r is not None and r.status == 200:
-                    pattern = site.url_pattern
-                    urls.extend(
-                        u for u in extract_links(r.text(), r.url)
-                        if robots.allowed(u) and (pattern.search(u) if pattern else keep_page_url(site, u))
-                    )
-            if not urls:
-                report["problem"] = "no URLs found in sitemaps or on the start page"
-                return report
-        tested = []
-        for url in random.sample(urls, min(samples, len(urls))):
-            r = await w._get(url)
-            if r is None or r.status != 200:
-                tested.append({"url": url, "status": r.status if r else "network error"})
-                continue
-            recipes = extract_recipes(r.text(), url)
-            tested.append({
-                "url": url, "status": r.status,
-                "recipe": recipes[0].name if recipes else None,
-                "ingredients": len(recipes[0].ingredients) if recipes else 0,
-                "steps": len(recipes[0].instructions) if recipes else 0,
-                "language": recipes[0].language if recipes else None,
-            })
-        report["samples"] = tested
-        hits = sum(1 for t in tested if t.get("recipe"))
-        report["recipe_hit_rate"] = f"{hits}/{len(tested)}"
-        report["ok"] = hits > 0
-        if hits and report.get("mode") == "links" and not site.follow_links:
-            report["problem"] = ("no recipe sitemaps; add this site with follow_links = true and a "
-                                 "url_pattern matching the recipe URLs above")
-    finally:
-        await crawler.fetcher.aclose()
-        db.close()
-    return report
-
-
 def cmd_probe(settings: Settings, args: argparse.Namespace) -> None:
     async def main():
         sem = asyncio.Semaphore(16)
 
         async def one(d):
             async with sem:
-                return await _probe(settings, d.lower(), args.samples, args.max_sitemaps)
+                return await probe_site(settings, d.lower(), args.samples, args.max_sitemaps)
 
         return await asyncio.gather(*(one(d) for d in args.domains))
 
@@ -177,7 +105,7 @@ def cmd_probe(settings: Settings, args: argparse.Namespace) -> None:
 
 
 def cmd_stats(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path)
+    db = DB(settings.db_path, readonly=True)
     rows = db.stats()
     print(f"{'domain':<34}{'recipes':>9}{'pending':>10}{'done':>9}{'no_rec':>9}{'errors':>8}{'blocked':>9}")
     for r in rows:
@@ -201,7 +129,7 @@ def _fingerprint(rec: dict) -> str:
 
 
 def cmd_export(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path)
+    db = DB(settings.db_path, readonly=True)
     seen: set[str] = set()
     n = dupes = 0
     langs: Counter[str] = Counter()
@@ -227,7 +155,7 @@ def cmd_export(settings: Settings, args: argparse.Namespace) -> None:
 
 
 def cmd_lines(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path)
+    db = open_db(settings)
     ingredients.collect_lines(db.conn, settings.ingredients)
     db.close()
 
@@ -245,32 +173,18 @@ def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
     keys = gemini.load_keys(keys_file)
     usage = gemini.UsageLog(cfg.usage_log)
     used = usage.used_today(keys)
-    db = DB(settings.db_path)
     if args.dry_run:  # no migrations, no requests, no usage records
-        if not db.conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'ingredient_lines'").fetchone():
+        db = DB(settings.db_path, readonly=True)
+        try:
+            print("\n".join(ingredients.dry_run(db.conn, cfg, keys, used, show_prompt=args.verbose)))
+        finally:
             db.close()
-            raise SystemExit("No ingredient_lines table yet: run `recipe-crawler lines` first.")
-        todo = ingredients.todo_lines(db.conn)
-        db.close()
-        print(f"{len(todo):,} lines to do = {-(-len(todo) // cfg.batch_size):,} requests of {cfg.batch_size}")
-        for k in keys:
-            for m in cfg.models:
-                print(f"  lane {gemini.fingerprint(k)}/{m}: {used[gemini.fingerprint(k), m]}/{cfg.rpd or '-'} used today")
-        first = [line.text for line in todo[:cfg.batch_size]]
-        print(f"first request ({len(first)} lines, prompt {len(gemini.PROMPT):,} chars):")
-        for i, text in enumerate(first[:20]):
-            print(f"  [{i}, {json.dumps(text, ensure_ascii=False)}]")
-        if len(first) > 20:
-            print(f"  ... {len(first) - 20} more")
-        if args.verbose:
-            print(gemini.PROMPT)
         return
-    ingredients.ensure_schema(db.conn)
-    lanes = [gemini.Lane(k, gemini.GeminiClient(k), m, used[gemini.fingerprint(k), m], cfg.rpd)
-             for m in cfg.models for k in keys]
-    for lane in lanes:
-        lane.exhausted = (lane.key, lane.model) in usage.exhausted
-    processor = gemini.Processor(cfg, lanes, usage, ingredients.make_save(db.conn), max_requests=args.max_requests)
+    db = open_db(settings)
+    ingredients.apply_spool(db.conn, cfg)
+    lanes = ingredients.build_lanes(cfg, keys, usage, used)
+    processor = gemini.Processor(cfg, lanes, usage, ingredients.make_save(db.conn), max_requests=args.max_requests,
+                                 spool=ingredients.spool_path(cfg))
 
     def stop(*_: object) -> None:
         if processor.stopping:
@@ -288,15 +202,32 @@ def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
 
 
 def cmd_map(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path)
+    db = open_db(settings)
     ingredients.map_ingredients(db.conn, settings.ingredients, full=args.full)
     db.close()
 
 
 def cmd_names(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path)
+    db = DB(settings.db_path, readonly=True)
     print("\n".join(ingredients.names_report(db.conn)))
     db.close()
+
+
+# --------------------------------------------------------------------------- backup / check
+
+
+def cmd_backup(settings: Settings, args: argparse.Namespace) -> None:
+    DB(settings.db_path, readonly=True).close()  # refuses a missing DB
+    for path in backup.run(settings.db_path, settings.backup, force_full=args.full):
+        print(f"wrote {path}")
+    print(backup.checkpoint(settings.db_path))
+
+
+def cmd_check(settings: Settings, args: argparse.Namespace) -> None:
+    ok, lines = backup.check(settings.backup)
+    print("\n".join(lines))
+    if not ok:
+        raise SystemExit(1)
 
 
 # --------------------------------------------------------------------------- main
@@ -346,6 +277,10 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("names", help="(next step, stub) standardize ingredient names via ingredient_names")
 
+    sp = sub.add_parser("backup", help="daily backup of the irreplaceable tables, a full one when due")
+    sp.add_argument("--full", action="store_true", help="also take a full backup now")
+    sub.add_parser("check", help="quick_check the newest backups and check that they are recent")
+
     args = p.parse_args(argv)
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if args.log_file:
@@ -364,21 +299,33 @@ def main(argv: list[str] | None = None) -> None:
         logging.getLogger("crawler").setLevel(logging.ERROR)
     settings = load_config(args.config, require_contact=args.cmd in ("probe", "discover", "crawl"))
 
-    if args.cmd == "probe":
-        cmd_probe(settings, args)
-    elif args.cmd == "discover":
-        cmd_crawl(settings, args, discover_only=True)
-    elif args.cmd == "crawl":
-        cmd_crawl(settings, args)
-    elif args.cmd == "stats":
-        cmd_stats(settings, args)
-    elif args.cmd == "export":
-        cmd_export(settings, args)
-    elif args.cmd == "lines":
-        cmd_lines(settings, args)
-    elif args.cmd == "process":
-        cmd_process(settings, args)
-    elif args.cmd == "map":
-        cmd_map(settings, args)
-    elif args.cmd == "names":
-        cmd_names(settings, args)
+    # One instance per command and database (discover and crawl count as one).
+    instance = {"discover": "crawl", "crawl": "crawl", "lines": "lines", "map": "map", "backup": "backup",
+                "process": None if getattr(args, "dry_run", False) else "process"}.get(args.cmd)
+    lock = single_instance(settings.db_path, instance) if instance else None
+    try:
+        if args.cmd == "probe":
+            cmd_probe(settings, args)
+        elif args.cmd == "discover":
+            cmd_crawl(settings, args, discover_only=True)
+        elif args.cmd == "crawl":
+            cmd_crawl(settings, args)
+        elif args.cmd == "stats":
+            cmd_stats(settings, args)
+        elif args.cmd == "export":
+            cmd_export(settings, args)
+        elif args.cmd == "lines":
+            cmd_lines(settings, args)
+        elif args.cmd == "process":
+            cmd_process(settings, args)
+        elif args.cmd == "map":
+            cmd_map(settings, args)
+        elif args.cmd == "names":
+            cmd_names(settings, args)
+        elif args.cmd == "backup":
+            cmd_backup(settings, args)
+        elif args.cmd == "check":
+            cmd_check(settings, args)
+    finally:
+        if lock is not None:
+            os.close(lock)

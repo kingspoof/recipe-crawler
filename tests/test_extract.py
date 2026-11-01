@@ -96,3 +96,10 @@ def test_microdata_ignores_nested_items():
            <h1 itemprop="name">Kifle</h1><li itemprop="recipeIngredient">flour</li></div>"""
     [r] = extract_recipes(p, "u")
     assert r.name == "Kifle"
+
+
+def test_sitemap_with_bom():
+    """Regression: a UTF-8 BOM made the XML look like a plain-text sitemap without URLs."""
+    urlset = b'\xef\xbb\xbf<?xml version="1.0"?><urlset><url><loc>https://x/a</loc></url></urlset>'
+    assert parse_sitemap(urlset) == ([], ["https://x/a"])
+    assert parse_sitemap(b"\n" + urlset) == ([], ["https://x/a"])
