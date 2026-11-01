@@ -332,3 +332,12 @@ def test_migration_3_on_a_v2_database(tmp_path):
     schema.MIGRATIONS[2].apply(db.conn)  # applying it again directly is a no-op too (idempotent)
     assert db.conn.execute("SELECT COUNT(*) FROM candidate_links").fetchone()[0] == 1
     db.close()
+
+
+def test_external_hosts_is_linear_on_hostile_pages():
+    for page in ("<a " * 350_000, ("<a " + "b" * 999) * 1000, "<a href=" * 150_000):  # ~1 MB each
+        start = time.perf_counter()
+        scout.external_hosts(page, "x.com")
+        assert time.perf_counter() - start < 1.0
+    attrs = 'class="x" ' + 'data-x="y" ' * 80  # long but normal attribute lists still match
+    assert scout.external_hosts(f'<a {attrs}href="https://ok.com/">', "x.com") == {"ok.com"}

@@ -148,7 +148,9 @@ class Filter:
 # --------------------------------------------------------------------------- 1. links seen while crawling
 
 # Only absolute (or protocol-relative) links can point to another site; just the host is captured.
-_EXT_HREF_RE = re.compile(r"""<a\s[^>]*?href\s*=\s*["']?(?:https?:)?//([^/"'\s?#:>\\]+)""", re.IGNORECASE)
+# The attribute scan stops at the next "<" and after 1000 chars: with `[^>]*?` a page full of "<a " and no ">"
+# took minutes (quadratic), blocking the domain and a shared executor thread. This runs on every crawled page.
+_EXT_HREF_RE = re.compile(r"""<a\s[^<>]{0,1000}?href\s*=\s*["']?(?:https?:)?//([^/"'\s?#:>\\]+)""", re.IGNORECASE)
 
 
 def external_hosts(page: str, own_domain: str) -> set[str]:
