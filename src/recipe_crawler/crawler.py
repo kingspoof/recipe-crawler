@@ -16,6 +16,7 @@ from .config import Settings, Site
 from .db import DB
 from .extract import extract_links, extract_recipes
 from .net import MAX_SITEMAP_BYTES, Fetcher, Response, Robots, Throttle, TooLarge, fetch_robots
+from .scout import LinkCollector, external_hosts
 from .sitemaps import FALLBACK_SITEMAPS, iter_sitemaps, select_sitemaps, keep_followed_link, keep_page_url
 
 log = logging.getLogger("crawler")
@@ -54,6 +55,8 @@ class DomainWorker:
         self.robots: Robots | None = None  # of the site itself, as of the last fetch
         self._robots: dict[str, tuple[Robots, float]] = {}  # origin -> (robots.txt, valid until), every host
         self.clock = time.monotonic
+        self.robots_problem: str | None = None  # why the site's own robots.txt could not be used
+        self.setup_problem: str | None = None  # why setup() skipped the domain
         self.throttle = Throttle(site.delay or crawler.settings.default_delay)
         self.consecutive_failures = 0
         self.pages = 0
@@ -85,6 +88,8 @@ class DomainWorker:
         self._robots[origin] = (robots, self.clock() + valid)
         if origin == _origin(self.site.base_url):
             self.robots = robots
+            # only a problem if it is in effect (not when an older good copy is kept)
+            self.robots_problem = problem if robots.unreachable else None
         return robots
 
     async def allowed(self, url: str) -> bool:
@@ -141,7 +146,8 @@ class DomainWorker:
     async def setup(self) -> bool:
         self.robots = await self.robots_for(self.site.base_url)
         if self.robots.unreachable:
-            self.log.warning("skipping domain: robots.txt unreachable or blocking bots")
+            self.setup_problem = self.robots_problem or "robots.txt unreachable or blocking bots"
+            self.log.warning("skipping domain: %s", self.setup_problem)
             return False
         if self.robots.crawl_delay:
             self.throttle = Throttle(max(self.throttle.base_delay, min(self.robots.crawl_delay, 60)))
@@ -273,6 +279,11 @@ class DomainWorker:
             self.db.mark(url, "no_recipe", r.status, f"content-type {r.content_type}")
             return
         page = r.text()
+        if self.c.links is not None:
+            try:
+                self.c.links.add(self.site.domain, await asyncio.to_thread(external_hosts, page, self.site.domain))
+            except Exception:  # candidate links are a side product: never let them stop the crawl
+                self.log.debug("collecting candidate links failed on %s", url, exc_info=True)
         if self.site.follow_links:
             links = await asyncio.to_thread(extract_links, page, r.url)
             self.db.add_urls(self.site.domain, await self.filter_allowed(
@@ -316,6 +327,8 @@ class Crawler:
         self.total = db.recipe_count()
         self.region_total: defaultdict[str, int] = defaultdict(int, db.region_counts())
         self.workers: list[DomainWorker] = []
+        # External domains seen on crawled pages, for `scout --from-links`.
+        self.links: LinkCollector | None = LinkCollector(db, settings) if settings.scout.collect_links else None
 
     @property
     def stopping(self) -> bool:
@@ -372,4 +385,6 @@ class Crawler:
         finally:
             stopped.cancel()
             reporter.cancel()
+            if self.links is not None:
+                self.links.flush()
             await self.fetcher.aclose()
