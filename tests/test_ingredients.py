@@ -38,7 +38,7 @@ class FakeClient:
         self.handler = handler
         self.calls = []
 
-    def generate(self, model, contents, cfg):
+    def generate(self, model, contents, cfg, schema=None):
         lines = json.loads(contents[len(gemini.PROMPT):])
         self.calls.append([text for _, text in lines])
         if self.handler:
@@ -699,3 +699,123 @@ def test_network_error_is_not_blamed_even_when_others_succeed(cfg):
         p._server_error(lane, batch, "network ConnectError()", retry, todo)
         p.successes["m"] += 3  # other batches keep succeeding in between
         assert list(retry) == batch and all(line.max_batch == 0 and line.server_errors == 0 for line in batch)
+
+
+# --------------------------------------------------------------------------- names
+
+
+class NamesClient:
+    """Answers names from `canon` (missing: unchanged; None: not food), unless `handler` says otherwise."""
+
+    def __init__(self, canon, handler=None):
+        self.canon, self.handler, self.calls = canon, handler, []
+
+    def generate(self, model, contents, cfg, schema=None):
+        assert contents.startswith(ingredients.NAMES_PROMPT) and schema is ingredients.NAMES_SCHEMA
+        names = json.loads(contents[len(ingredients.NAMES_PROMPT):])
+        self.calls.append([name for _, name in names])
+        if self.handler and (reply := self.handler(len(self.calls), names)) is not None:
+            return reply
+        out = [{"i": i, "c": self.canon.get(name, name)} for i, name in names]
+        return Reply(json.dumps(out), {}, "STOP")
+
+
+def run_names(db, cfg, client, rounds=ingredients.NAMES_ROUNDS):
+    cfg = ingredients.names_settings(cfg)
+    usage = UsageLog(cfg.usage_log)
+    clock = FakeClock()
+    p = Processor(cfg, [Lane("k1", client, "m", 0, cfg.rpd)], usage, ingredients.make_save_names(db.conn),
+                  clock=clock, sleep=clock.sleep, retry_sleep=lambda s: None, task=ingredients.NAMES)
+    counts = ingredients.name_counts(db.conn)
+    for _ in range(rounds):
+        todo = ingredients.todo_names(db.conn, counts)
+        if not todo or p.run(todo) != "done":
+            break
+    return dict(db.conn.execute("SELECT name, canonical FROM ingredient_names"))
+
+
+def test_parse_names():
+    result = [{"i": 0, "c": " Powdered  Sugar "}, {"i": 1, "c": None}, {"i": 2, "c": "x" * 61}, {"i": 3, "c": ""},
+              {"i": 4, "c": 5}, {"i": 9, "c": "egg"}, {"i": True, "c": "egg"}, {"i": 0, "c": "later duplicate"}]
+    assert ingredients.parse_names(5, result) == {0: "powdered sugar", 1: ""}
+    assert ingredients.parse_names(3, None) == {}
+
+
+def test_resolve_follows_chains_and_stops_cycles():
+    assert ingredients.resolve({"a": "b", "b": "c", "c": "c", "d": "", "e": "b"}) == \
+        {"a": "c", "b": "c", "c": "c", "d": "", "e": "c"}
+    assert ingredients.resolve({"x": "y", "y": "x"}) == {"x": "x", "y": "y"}  # cycle: no infinite loop
+
+
+def test_todo_names_groups_by_last_word_and_skips_known(db, cfg):
+    ingredients.ensure_schema(db.conn)
+    done(db.conn, "a", [["icing sugar", 1, "g"], ["salt", None, None]], 1)
+    done(db.conn, "b", [["powdered sugar", 1, "g"], ["sea salt", None, None]], 1)
+    done(db.conn, "c", [["brown sugar", None, None], [None, None, None]], 1)
+    db.conn.execute("INSERT INTO ingredient_names VALUES ('brown sugar', 'brown sugar')")
+    assert [line.text for line in ingredients.todo_names(db.conn)] == [
+        "salt", "sea salt", "icing sugar", "powdered sugar"]  # salt < sugar; same count: alphabetical
+
+
+def test_names_rounds_merge_drop_and_apply(db, cfg):
+    ingredients.ensure_schema(db.conn)
+    r1 = add_recipe(db.conn, ["2 tbsp icing sugar", "1 spring onion", "foil"])
+    r2 = add_recipe(db.conn, ["1 medium tomato", "1 green onion"])
+    done(db.conn, "2 tbsp icing sugar", [["icing sugar", 2, "tbsp"]], 1)
+    done(db.conn, "1 spring onion", [["spring onion", 1, None]], 1)
+    done(db.conn, "foil", [["aluminium foil", None, None]], 1)
+    done(db.conn, "1 medium tomato", [["medium tomato", 1, None]], 1)
+    done(db.conn, "1 green onion", [["green onion", 1, None]], 1)
+    ingredients.map_ingredients(db.conn, cfg)
+    # round 1 invents "green onion stalk" for spring onion; round 2 maps that new name to scallion
+    canon = {"icing sugar": "powdered sugar", "spring onion": "green onion stalk", "green onion": "scallion",
+             "green onion stalk": "scallion", "medium tomato": "tomato", "aluminium foil": None}
+    client = NamesClient(canon)
+    names = run_names(db, cfg, client)
+    assert names["aluminium foil"] == "" and names["green onion stalk"] == "scallion"
+    assert len(client.calls) == 2  # round 1: the 5 names; round 2: the 4 new canonical names; round 3: none new
+    assert sorted(client.calls[1]) == ["green onion stalk", "powdered sugar", "scallion", "tomato"]
+    assert ingredients.todo_names(db.conn) == []
+    stats = ingredients.apply_names(db.conn)
+    assert stats["deleted"] == 1
+    assert sorted(r[3] for r in ri(db.conn) if r[0] == r1) == ["powdered sugar", "scallion"]
+    assert sorted(r[3] for r in ri(db.conn) if r[0] == r2) == ["scallion", "tomato"]
+    applied = ri(db.conn)
+    ingredients.map_ingredients(db.conn, cfg, full=True)  # map applies the same names (chains, not food)
+    assert ri(db.conn) == applied
+    assert ingredients.apply_names(db.conn)["names"] == 0  # nothing left to change
+
+
+def test_names_left_out_stay_to_do(db, cfg):
+    ingredients.ensure_schema(db.conn)
+    done(db.conn, "x", [["salt", None, None], ["sugar", None, None]], 1)
+    client = NamesClient({}, handler=lambda n, names: Reply(
+        json.dumps([{"i": i, "c": name} for i, name in names if name != "sugar"]), {}, "STOP"))
+    names = run_names(db, cfg, client, rounds=1)
+    assert names == {"salt": "salt"}
+    assert [line.text for line in ingredients.todo_names(db.conn)] == ["sugar"]
+
+
+def test_names_spool_survives_a_locked_database(db, cfg, tmp_path):
+    ingredients.ensure_schema(db.conn)
+    done(db.conn, "x", [["icing sugar", None, None]], 1)
+    ncfg = ingredients.names_settings(cfg)
+    spool = ingredients.names_spool_path(ncfg)
+
+    def broken(*_):
+        raise sqlite3.OperationalError("database is locked")
+
+    p = Processor(ncfg, [Lane("k1", NamesClient({"icing sugar": "powdered sugar"}), "m", 0, ncfg.rpd)],
+                  UsageLog(ncfg.usage_log), broken, clock=FakeClock(), sleep=lambda s: None,
+                  retry_sleep=lambda s: None, spool=spool, task=ingredients.NAMES)
+    p.run(ingredients.todo_names(db.conn))
+    assert spool.exists()
+    assert ingredients.apply_names_spool(db.conn, ncfg) == 1 and not spool.exists()
+    assert dict(db.conn.execute("SELECT * FROM ingredient_names")) == {"icing sugar": "powdered sugar"}
+
+
+def test_names_requests_are_tagged_in_the_usage_log(db, cfg):
+    ingredients.ensure_schema(db.conn)
+    done(db.conn, "x", [["salt", None, None]], 1)
+    run_names(db, cfg, NamesClient({}))
+    assert [r.get("task") for r in usage_records(cfg)] == ["names"]

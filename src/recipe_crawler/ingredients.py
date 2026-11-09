@@ -14,25 +14,31 @@ Tables (all created / migrated here, additively, on the first write command):
 - recipe_ingredients_state: one row per mapped recipe: when it was mapped and how many of its lines were still
   not done then. Incremental `map` only looks at recipes without a row or with pending > 0, and rebuilds those
   that have a line done after their mapped_at.
-- ingredient_names: name -> canonical, applied in `map` (filled by a future `names` step).
+- ingredient_names: name -> canonical, filled by `names` (step 4) and applied in `map`. canonical '' = not food:
+  `map` leaves the name out. A canonical can itself be a name with another canonical: chains are followed.
+
+4. `names`: every distinct name (from the answers in ingredient_lines) that has no canonical yet goes to Gemini,
+   which merges synonyms, regional names and spellings and drops filler words. The result is applied to
+   recipe_ingredients right away (UPDATE / DELETE by name), so no `map --full` is needed.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import sqlite3
 import time
 from collections import Counter
-from typing import Callable
+from typing import Any, Callable
 from .config import IngredientSettings
 from . import schema
 from .db import transaction as _tx
 from .schema import RECIPE_INGREDIENTS
 from .schema import columns as _columns
 from .schema import has_table as _has_table
-from .gemini import (GAVE_UP, PROMPT, Client, GeminiClient, Lane, Line, UsageLog, fingerprint, next_reset, quota_day,
-                     spool_read)
+from .gemini import (GAVE_UP, PROMPT, Client, GeminiClient, Lane, Line, Task, UsageLog, fingerprint, next_reset,
+                     quota_day, spool_read)
 
 log = logging.getLogger("ingredients")
 
@@ -220,7 +226,7 @@ def map_ingredients(conn: sqlite3.Connection, cfg: IngredientSettings, full: boo
     if not full and conn.execute("SELECT 1 FROM recipe_ingredients_state LIMIT 1").fetchone() is None:
         log.info("no map state yet: full rebuild")
         full = True
-    canonical = dict(conn.execute("SELECT name, canonical FROM ingredient_names"))
+    canonical = resolve(dict(conn.execute("SELECT name, canonical FROM ingredient_names")))
     stats = Counter({"recipes": 0, "rebuilt": 0, "rows": 0, "complete": 0})
 
     def rows_for(recipe_id: int, lines: list[str], done: dict[str, tuple[int, list, float]]) -> tuple[list, int]:
@@ -230,7 +236,8 @@ def map_ingredients(conn: sqlite3.Connection, cfg: IngredientSettings, full: boo
                 line_id, entries, _ = done[line]
                 for entry in entries:
                     if isinstance(entry, list) and len(entry) == 3 and (c := clean(*entry)):
-                        rows.append((recipe_id, pos, line_id, canonical.get(c[0], c[0]), c[1], c[2]))
+                        if name := canonical.get(c[0], c[0]):  # '' = not food
+                            rows.append((recipe_id, pos, line_id, name, c[1], c[2]))
             elif line and len(line) <= cfg.max_line_chars:  # to do, or failed (can be reset to 0 by hand)
                 pending += 1
         return rows, pending
@@ -320,22 +327,222 @@ def _map_chunk(conn, chunk, rows_for, started, stats, insert, insert_state) -> N
         stats["complete"] += pending == 0
 
 
-# --------------------------------------------------------------------------- names (next step)
+# --------------------------------------------------------------------------- step 4: names
+
+NAMES_BATCH = 500  # names per request: ~12 output tokens each; big batches keep a group of variants together
+NAMES_ROUNDS = 3  # new canonical names the model invents are sent again, until nothing new comes back
+
+NAMES_PROMPT = """You standardize ingredient names from recipes, so that one ingredient always has one name.
+
+The input is a JSON array of [index, name]. The names are already English, lowercase and singular (a few are not
+translated yet: translate them, e.g. "air" is Malay for water). For every name return {"i": index, "c": standard name}:
+- c: the name American recipes use for this ingredient, lowercase, singular, without brand, correctly spelled
+  (turmeric, never "tumeric"; vanillin, never "vanilin"), also when a misspelled variant is in the input.
+  Return the name unchanged if it is already the standard name.
+- Synonyms, regional names and spelling variants get the same name. Use these:
+  scallion (green onion, spring onion), cilantro (coriander leaf, fresh coriander, chinese parsley),
+  powdered sugar (icing sugar, confectioners' sugar), superfine sugar (caster sugar), all-purpose flour (plain flour),
+  cornstarch (corn starch), baking soda (bicarbonate of soda),
+  eggplant (aubergine), zucchini (courgette), bell pepper (capsicum, sweet pepper), arugula (rocket),
+  chickpea (garbanzo bean), shrimp (prawn), ground beef (minced beef, beef mince), panko (panko breadcrumb).
+- Drop words that do not change what you buy: size (small, medium, large, big), temperature (warm, cold, lukewarm,
+  tepid, room temperature), freshness and quality (fresh, good, ripe, best, homemade, store-bought), "of choice".
+- Keep words that make it a different product: variety or color (red onion, green bell pepper, brown sugar,
+  basmati rice), part
+  (egg yolk, chicken breast, lemon zest), kind (olive oil, whole milk, smoked salmon, ground cinnamon vs cinnamon
+  stick), processing that makes it a different product (dried shrimp, salted fish, smoked salmon, fermented
+  shrimp paste, pickled ginger, canned tuna, cured ham), named varieties and origins (manzano pepper, turkish pepper, korean chili flakes, sweet paprika,
+  smoked paprika). Never generalize to a broader ingredient: superfine sugar is not sugar, olive oil is not oil.
+- A name with several ingredients ("salt and pepper", "parsley and green onion"): keep it unchanged, never pick one.
+- If a name can mean different ingredients, keep it unchanged: "coriander" (leaf or seed), "pepper" (black pepper
+  or bell pepper), "red pepper" (red bell pepper or chili flakes), "cream", "corn flour" (cornmeal or cornstarch).
+- Names in the same input that mean the same ingredient must get exactly the same name.
+- Not food (equipment, packaging, utensils, things that are not eaten: "ziplock bag", "toothpick", "kettle grill",
+  "baking paper", "skewer"): c = null. Water, ice and salt are food, and so is everything that goes into the
+  dish or flavors it: rice paper, tea bag, spice bag, bouquet garni, and edible decorations: chocolate pen,
+  sprinkles, edible glitter. A lone number or letter ("1", "a") is not food. When in doubt, it is food.
+Every index must appear in the output.
+
+Example input:  [[0, "spring onion"], [1, "green onion"], [2, "icing sugar"], [3, "medium tomato"],
+                 [4, "coriander leaf"], [5, "aluminium foil"], [6, "olive oil"], [7, "lukewarm water"],
+                 [8, "coriander"], [9, "panko bread crumb"], [10, "brown sugar"], [11, "aubergine"],
+                 [12, "green pepper"], [13, "rice paper"], [14, "tumeric"], [15, "turmeric"], [16, "salt and pepper"],
+                 [17, "dried shrimp"], [18, "air"]]
+Example output: [{"i":0,"c":"scallion"},{"i":1,"c":"scallion"},{"i":2,"c":"powdered sugar"},{"i":3,"c":"tomato"},{"i":4,"c":"cilantro"},{"i":5,"c":null},{"i":6,"c":"olive oil"},{"i":7,"c":"water"},{"i":8,"c":"coriander"},{"i":9,"c":"panko"},{"i":10,"c":"brown sugar"},{"i":11,"c":"eggplant"},{"i":12,"c":"green bell pepper"},{"i":13,"c":"rice paper"},{"i":14,"c":"turmeric"},{"i":15,"c":"turmeric"},{"i":16,"c":"salt and pepper"},{"i":17,"c":"dried shrimp"},{"i":18,"c":"water"}]
+
+Input:
+"""
+
+NAMES_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {"i": {"type": "integer"}, "c": {"type": ["string", "null"]}},
+        "required": ["i", "c"],
+    },
+}
 
 
-def names_report(conn: sqlite3.Connection) -> list[str]:
-    """Stub of the name standardization step: shows what there is to merge. Merging itself is not built yet."""
-    if not _has_table(conn, "recipe_ingredients"):
-        return ["no recipe_ingredients yet: run `recipe-crawler map`"]
-    distinct, rows = conn.execute("SELECT COUNT(DISTINCT name), COUNT(*) FROM recipe_ingredients").fetchone()
-    mapped = conn.execute("SELECT COUNT(*) FROM ingredient_names").fetchone()[0]
-    top = conn.execute("SELECT name, COUNT(*) FROM recipe_ingredients GROUP BY 1 ORDER BY 2 DESC LIMIT 20").fetchall()
-    return [
-        f"{distinct:,} distinct names in {rows:,} recipe_ingredients rows, {mapped:,} with a canonical name",
-        "most common: " + ", ".join(f"{n} ({c:,})" for n, c in top),
-        "Merging names into canonical ones (ingredient_names) is not implemented yet: fill the table by hand or "
-        "with a future `names --merge`, then run `map --full`.",
+def parse_names(n: int, result: Any) -> dict[int, str]:
+    """{index: canonical} for every name answered; '' = not food. A name that is not a usable name (too long,
+    not a string) counts as left out."""
+    out: dict[int, str] = {}
+    for item in result if isinstance(result, list) else []:
+        i = item.get("i") if isinstance(item, dict) else None
+        if not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < n or i in out:
+            continue
+        c = item.get("c")
+        if c is None:
+            out[i] = ""
+        elif isinstance(c, str) and (c := " ".join(c.split()).lower()) and len(c) <= 60 and c not in ("null", "none"):
+            out[i] = c
+    return out
+
+
+NAMES = Task("names", NAMES_PROMPT, NAMES_SCHEMA, parse_names)
+
+
+def resolve(mapping: dict[str, str]) -> dict[str, str]:
+    """Follows chains (a -> b, b -> c gives a -> c). A cycle stops at the name where it closes."""
+    out: dict[str, str] = {}
+    for name in mapping:
+        seen = {name}
+        target = mapping[name]
+        while target and target in mapping and mapping[target] != target and target not in seen:
+            seen.add(target)
+            target = mapping[target]
+        out[name] = target
+    return out
+
+
+def name_counts(conn: sqlite3.Connection) -> Counter[str]:
+    """Every name in the answers (after clean(), before ingredient_names), with how many recipe lines use it."""
+    counts: Counter[str] = Counter()
+    for items, n in conn.execute("SELECT items, n FROM ingredient_lines WHERE status = 1"):
+        for entry in json.loads(items):
+            if isinstance(entry, list) and len(entry) == 3 and (c := clean(*entry)):
+                counts[c[0]] += n
+    return counts
+
+
+def todo_names(conn: sqlite3.Connection, counts: Counter[str] | None = None) -> list[Line]:
+    """Names without a canonical yet: from the answers, plus canonical names that are not names themselves.
+    Sorted by the last word, so variants of one ingredient ("icing sugar", "powdered sugar") share a request."""
+    counts = Counter(counts if counts is not None else name_counts(conn))
+    known = dict(conn.execute("SELECT name, canonical FROM ingredient_names"))
+    for name, canonical in known.items():
+        if canonical and canonical not in known:
+            counts[canonical] += counts.get(name, 0) or 1
+    todo = [(name, n) for name, n in counts.items() if name not in known]
+    todo.sort(key=lambda x: (x[0].split()[-1], -x[1], x[0]))
+    return [Line(name, name) for name, _ in todo]
+
+
+def names_settings(cfg: IngredientSettings) -> IngredientSettings:
+    return dataclasses.replace(cfg, batch_size=NAMES_BATCH)
+
+
+def names_spool_path(cfg: IngredientSettings):
+    return cfg.usage_log.parent / "unsaved_names.jsonl"
+
+
+def make_save_names(conn: sqlite3.Connection):
+    """Saves canonical names. Names the model left out stay to do (sent again next run), nothing is marked."""
+    conn.execute(f"PRAGMA busy_timeout = {SAVE_BUSY_TIMEOUT_MS}")
+
+    def save(answered: list[tuple[str, str]], failed: list[str], model: str, gave_up: list[str] = ()) -> None:  # type: ignore[assignment]
+        with _tx(conn):
+            conn.executemany("INSERT OR REPLACE INTO ingredient_names (name, canonical) VALUES (?, ?)", answered)
+    return save
+
+
+def apply_names_spool(conn: sqlite3.Connection, cfg: IngredientSettings) -> int:
+    path = names_spool_path(cfg)
+    records = spool_read(path)
+    if not records and not path.exists():
+        return 0
+    save = make_save_names(conn)
+    for answered, _, model, _ in records:
+        save(answered, [], model)
+    path.unlink()
+    n = sum(len(r[0]) for r in records)
+    log.info("applied %s names from %s", f"{n:,}", path)
+    return n
+
+
+APPLY_CHUNK = 200  # names per transaction when renaming recipe_ingredients rows
+
+
+def apply_names(conn: sqlite3.Connection) -> dict[str, int]:
+    """Renames (or, for '' = not food, deletes) recipe_ingredients rows by name, through the name index.
+    Short transactions, so `crawl` and `process` can write in between."""
+    ensure_schema(conn)
+    t = time.time()
+    canonical = resolve(dict(conn.execute("SELECT name, canonical FROM ingredient_names")))
+    present = {name for (name,) in conn.execute("SELECT DISTINCT name FROM recipe_ingredients")}
+    changes = [(name, c) for name, c in canonical.items() if c != name and name in present]
+    stats = Counter({"names": 0, "renamed": 0, "deleted": 0})
+    for i in range(0, len(changes), APPLY_CHUNK):
+        with _tx(conn):
+            for name, c in changes[i:i + APPLY_CHUNK]:
+                if c:
+                    stats["renamed"] += conn.execute(
+                        "UPDATE recipe_ingredients SET name = ? WHERE name = ?", (c, name)).rowcount
+                else:
+                    stats["deleted"] += conn.execute(
+                        "DELETE FROM recipe_ingredients WHERE name = ?", (name,)).rowcount
+                stats["names"] += 1
+    log.info("recipe_ingredients: %s names changed, %s rows renamed, %s rows deleted (not food) in %.0f s",
+             f"{stats['names']:,}", f"{stats['renamed']:,}", f"{stats['deleted']:,}", time.time() - t)
+    return dict(stats)
+
+
+def names_dry_run(conn: sqlite3.Connection, cfg: IngredientSettings, show_prompt: bool = False) -> list[str]:
+    """What `names` would send. Reads only."""
+    if not _has_table(conn, "ingredient_lines"):
+        raise SystemExit("No ingredient_lines table yet: run `recipe-crawler lines` first.")
+    todo = todo_names(conn)
+    out = [f"{len(todo):,} names to do = {-(-len(todo) // NAMES_BATCH):,} requests of {NAMES_BATCH} (first round)"]
+    first = [line.text for line in todo[:NAMES_BATCH]]
+    out.append(f"first request ({len(first)} names, prompt {len(NAMES_PROMPT):,} chars):")
+    out += [f"  [{i}, {json.dumps(text, ensure_ascii=False)}]" for i, text in enumerate(first[:30])]
+    if len(first) > 30:
+        out.append(f"  ... {len(first) - 30} more")
+    if show_prompt:
+        out.append(NAMES_PROMPT)
+    return out
+
+
+def names_report(conn: sqlite3.Connection, limit: int = 25) -> list[str]:
+    """How far `names` is, and the biggest merges (by recipe lines)."""
+    if not _has_table(conn, "ingredient_lines"):
+        return ["no ingredient_lines yet: run `recipe-crawler lines`"]
+    counts = name_counts(conn)
+    canonical = resolve(dict(conn.execute("SELECT name, canonical FROM ingredient_names")))
+    done = [name for name in counts if name in canonical]
+    merged = [name for name in done if canonical[name] and canonical[name] != name]
+    dropped = [name for name in done if not canonical[name]]
+    groups: dict[str, list[str]] = {}
+    for name in merged:
+        groups.setdefault(canonical[name], []).append(name)
+    total = max(sum(counts.values()), 1)
+    out = [
+        f"{len(counts):,} distinct names in the answers: {len(done):,} with a canonical name "
+        f"({sum(counts[n] for n in done) / total:.1%} of the recipe lines), {len(counts) - len(done):,} to do",
+        f"  merged into another name: {len(merged):,} names, {sum(counts[n] for n in merged):,} recipe lines",
+        f"  not food (left out):      {len(dropped):,} names, {sum(counts[n] for n in dropped):,} recipe lines",
+        f"  -> {len({canonical.get(n, n) for n in counts} - {''}):,} distinct names after merging",
+        "biggest merges:",
     ]
+    by_lines = sorted(groups.items(), key=lambda g: -sum(counts[n] for n in g[1]))
+    for target, names in by_lines[:limit]:
+        names.sort(key=lambda n: -counts[n])
+        shown = ", ".join(f"{n} ({counts[n]:,})" for n in names[:6]) + (f", +{len(names) - 6}" if len(names) > 6 else "")
+        out.append(f"  {target} <- {shown}")
+    if dropped:
+        dropped.sort(key=lambda n: -counts[n])
+        out.append("not food: " + ", ".join(f"{n} ({counts[n]:,})" for n in dropped[:15]))
+    return out
 
 
 # --------------------------------------------------------------------------- stats

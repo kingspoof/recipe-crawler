@@ -42,7 +42,10 @@ uv run recipe-crawler lines            # collect new distinct lines into ingredi
 uv run recipe-crawler process --dry-run  # what would be sent, today's quota per key
 uv run recipe-crawler process          # send to-do lines (most common first) until today's quota is used up
 uv run recipe-crawler map              # incremental: new recipes and recipes with newly done lines
-uv run recipe-crawler map --full       # drop and rebuild (needed after changing UNIT_FIX or ingredient_names)
+uv run recipe-crawler map --full       # drop and rebuild (needed after changing UNIT_FIX or splitting names again)
+uv run recipe-crawler names --dry-run  # names without a canonical name yet, and the first request
+uv run recipe-crawler names            # merge new names with Gemini and apply them to recipe_ingredients
+uv run recipe-crawler names --report   # progress and the biggest merges
 uv run recipe-crawler stats            # also ingredient progress, requests today per key x model, next reset
 uv run recipe-crawler --log-file data.nosync/ingredients.log process   # log to a file for scheduled runs
 ```
@@ -69,7 +72,17 @@ uv run recipe-crawler --log-file data.nosync/ingredients.log process   # log to 
   later answers go straight to that file, and the next `process` saves them first. So if `process` stops with
   "database not writable" after about half a minute, nothing is lost: find what held the lock (`map --full`,
   `sqlite3` left open in a transaction, a full disk) and run `process` again.
-- `names` is a stub for the next step (merging names like "cilantro" / "coriander" via `ingredient_names`).
+- **Names** (`names`): every distinct name in the answers gets one canonical name in `ingredient_names`
+  (`name`, `canonical`). Gemini merges synonyms, regional names and spellings (spring onion / green onion ->
+  scallion, icing sugar -> powdered sugar) and drops filler words (medium tomato -> tomato), but keeps different
+  products apart (superfine sugar, brown sugar and olive oil are not sugar / oil). Ambiguous names stay
+  ("coriander", "pepper"). Not food ("ziplock bag") gets canonical `''` and is left out of `recipe_ingredients`.
+  Requests group names by their last word, so variants share a request; new canonical names the model invents
+  are sent again (up to 3 rounds). Only names without a canonical are sent, so run it after `map` every day;
+  it shares the quota and usage log with `process` (records with `"task": "names"`). At the end the names are
+  applied to `recipe_ingredients` by an UPDATE / DELETE per name (`--apply-only` does only that); `map` applies
+  them to new rows. Merging cannot be undone in place: to split names again, change `ingredient_names` and run
+  `map --full`.
 
 ## Database safety
 
@@ -100,8 +113,8 @@ uv run recipe-crawler check           # quick_check of the newest backups; exit 
   sitemaps_read, urls_found FROM b.domains;`
 - **Schema versions** live in `src/recipe_crawler/schema.py` (`PRAGMA user_version`). A migration runs on the
   first write command after an update, takes a full backup first when it changes data, and refuses to run while
-  another `recipe-crawler` process uses the database. Read-only commands (`stats`, `export`, `names`,
-  `process --dry-run`) open the database read-only and never migrate. Code from this version on refuses a
+  another `recipe-crawler` process uses the database. Read-only commands (`stats`, `export`,
+  `names --report` / `--dry-run`, `process --dry-run`) open the database read-only and never migrate. Code from this version on refuses a
   database with a newer schema; older checkouts (before schema versioning) do not check, so don't run them
   against a migrated database.
 - Only one `crawl`, `process`, `map`, `lines` or `backup` runs at a time per database.
