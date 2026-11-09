@@ -84,6 +84,31 @@ uv run recipe-crawler --log-file data.nosync/ingredients.log process   # log to 
   them to new rows. Merging cannot be undone in place: to split names again, change `ingredient_names` and run
   `map --full`.
 
+## Ingredient graph (networkx)
+
+`graph` writes an ingredient co-occurrence graph from `recipe_ingredients` (with the merged names) as GraphML.
+It only reads the database, so it can run next to everything else.
+
+```bash
+uv run recipe-crawler graph data.nosync/ingredients.graphml                     # all recipes
+uv run recipe-crawler graph data.nosync/asia.graphml --region "East Asia" --region "Southeast Asia"
+uv run recipe-crawler graph data.nosync/de.graphml --language de --exclude salt --exclude water
+```
+
+- **Nodes**: ingredients used in at least `--min-recipes` recipes (default 20), with `recipes` (count) and
+  `share` (of the recipes counted). **Edges**: pairs used together in at least `--min-weight` recipes (default
+  10), with `weight` (recipes using both), `pmi` = log(P(a,b) / P(a)P(b)) and `npmi` (pmi normalized to [-1, 1];
+  better than `weight` for "goes together", which is dominated by salt, garlic and onion).
+- Filters: `--region`, `--country`, `--language` (`de` also matches `de-CH`), `--domain`, all repeatable;
+  `--exclude` leaves an ingredient out. The graph attributes record the filters and thresholds.
+- All recipes with the defaults: ~7.4K nodes, ~280K edges, 49 MB, 15 s, < 1 GB RAM.
+
+```python
+import networkx as nx
+g = nx.read_graphml("data.nosync/ingredients.graphml")
+sorted(g["cilantro"].items(), key=lambda e: -e[1]["npmi"])[:5]   # what goes with cilantro
+```
+
 ## Database safety
 
 `recipes.db` holds weeks of crawling and the Gemini answers paid for with quota. Set `[backup] dir` in

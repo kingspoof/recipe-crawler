@@ -12,6 +12,7 @@ dependencies = [
     "httpx>=0.28.1",
     "langdetect>=1.0.9",
     "lxml>=6.1.3",
+    "networkx>=3.7",
     "numpy>=2.5.4",
     "protego>=0.7.0",
 ]
