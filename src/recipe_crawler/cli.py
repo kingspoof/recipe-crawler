@@ -8,6 +8,7 @@
     uv run recipe-crawler lines                      # ingredient processing: collect lines,
     uv run recipe-crawler process                    #   send them to Gemini until today's quota is used,
     uv run recipe-crawler map                        #   map the results back to the recipes
+    uv run recipe-crawler scout --from-links --probe 20 --report   # find new sites, propose config lines
 """
 
 from __future__ import annotations
@@ -21,9 +22,10 @@ import os
 import signal
 import sys
 from collections import Counter
+from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import backup, gemini, ingredients
+from . import backup, gemini, ingredients, scout
 from .config import Settings, Site, load_config
 from .crawler import Crawler
 from .db import DB, single_instance
@@ -89,8 +91,10 @@ def cmd_probe(settings: Settings, args: argparse.Namespace) -> None:
         return
     for rep in reports:
         flag = "OK  " if rep["ok"] else "FAIL"
-        print(f"\n[{flag}] {rep['domain']}  hit rate {rep.get('recipe_hit_rate', '-')}"
-              f"  crawl-delay {rep.get('crawl_delay')}  discovery: {rep.get('mode', 'sitemaps')}")
+        est = f"  ~{rep['est_urls']:,} URLs" if rep.get("est_urls") else ""
+        print(f"\n[{flag}] {rep['domain']}  {rep['status']}  hit rate {rep.get('recipe_hit_rate', '-')}"
+              f"  crawl-delay {rep.get('crawl_delay')}  discovery: {rep.get('mode', 'sitemaps')}{est}"
+              f"  language: {rep.get('language') or '-'}")
         if rep.get("problem"):
             print(f"   problem: {rep['problem']}")
         for sm, n in rep.get("sitemaps_sampled", [])[:15]:
@@ -98,7 +102,34 @@ def cmd_probe(settings: Settings, args: argparse.Namespace) -> None:
         for t in rep.get("samples", []):
             label = (f"{t['recipe']!r} ({t['ingredients']} ingr, {t['steps']} steps, {t['language']})"
                      if t.get("recipe") else f"no recipe (HTTP {t['status']})")
+            if t.get("data_problem"):
+                label += f"  BAD DATA: {t['data_problem']}"
             print(f"   {urlsplit(t['url']).path[:70]:<70} {label}")
+
+
+# --------------------------------------------------------------------------- scout
+
+
+def cmd_scout(settings: Settings, args: argparse.Namespace) -> None:
+    db = open_db(settings)
+    try:
+        if args.import_wdc:
+            counts = scout.import_wdc(db, settings, Path(args.import_wdc))
+            print(f"WDC: {counts.get('read', 0):,} domains read, {counts.get('new', 0):,} new candidates, "
+                  f"{counts.get('updated', 0):,} updated; skipped {counts.get('configured', 0):,} configured, "
+                  f"{counts.get('excluded', 0):,} excluded, {counts.get('non-recipe', 0):,} non-recipe")
+        if args.from_links:
+            new, updated = scout.from_links(db, settings, args.min_sites)
+            print(f"links: {new:,} new candidates, {updated:,} updated "
+                  f"(linked from >= {args.min_sites or settings.scout.min_linked_sites} crawled sites)")
+        if args.probe:
+            results = asyncio.run(scout.probe_candidates(db, settings, args.probe))
+            print("probed:", ", ".join(f"{k}: {v}" for k, v in results.most_common()) or "nothing to probe")
+        if args.report:
+            print("\n".join(scout.report(db, settings, args.limit)))
+        print("\n".join(scout.summary(db)))
+    finally:
+        db.close()
 
 
 # --------------------------------------------------------------------------- stats / export
@@ -115,6 +146,7 @@ def cmd_stats(settings: Settings, args: argparse.Namespace) -> None:
     for col in ("site_region", "site_country", "language"):
         parts = ", ".join(f"{r['key']}: {r['n']}" for r in db.stats_by(col)[:30])
         print(f"by {col}: {parts}")
+    print("\n".join(scout.summary(db)))
     print("\ningredient lines:")
     print("\n".join(ingredients.progress(db.conn)))
     cfg = settings.ingredients
@@ -256,6 +288,16 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("stats", help="show crawl and ingredient progress, today's Gemini quota")
 
+    sp = sub.add_parser("scout", help="find candidate recipe sites, probe them, propose config lines (never enables)")
+    sp.add_argument("--from-links", action="store_true", help="add external domains linked from crawled pages")
+    sp.add_argument("--min-sites", type=int, help="with --from-links: linked from at least this many sites "
+                                                    "(default: scout.min_linked_sites)")
+    sp.add_argument("--import-wdc", metavar="FILE", help="add domains from a downloaded Web Data Commons "
+                                                          "Recipe domain list (csv/tsv/txt, .gz ok)")
+    sp.add_argument("--probe", type=int, metavar="N", help="probe at most N candidates (new ones first)")
+    sp.add_argument("--report", action="store_true", help="print config.toml lines for the good candidates")
+    sp.add_argument("--limit", type=int, default=50, help="candidates in the report")
+
     sp = sub.add_parser("export", help="export recipes as JSON Lines")
     sp.add_argument("output")
     sp.add_argument("--dedupe", action="store_true", help="drop recipes with same name + ingredients")
@@ -295,12 +337,14 @@ def main(argv: list[str] | None = None) -> None:
         handlers[1].setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("google_genai").setLevel(logging.WARNING)
-    if args.cmd == "probe":
+    if args.cmd in ("probe", "scout"):
         logging.getLogger("crawler").setLevel(logging.ERROR)
-    settings = load_config(args.config, require_contact=args.cmd in ("probe", "discover", "crawl"))
+    settings = load_config(args.config, require_contact=args.cmd in ("probe", "discover", "crawl")
+                           or (args.cmd == "scout" and bool(args.probe)))
 
     # One instance per command and database (discover and crawl count as one).
     instance = {"discover": "crawl", "crawl": "crawl", "lines": "lines", "map": "map", "backup": "backup",
+                "scout": "scout",
                 "process": None if getattr(args, "dry_run", False) else "process"}.get(args.cmd)
     lock = single_instance(settings.db_path, instance) if instance else None
     try:
@@ -312,6 +356,8 @@ def main(argv: list[str] | None = None) -> None:
             cmd_crawl(settings, args)
         elif args.cmd == "stats":
             cmd_stats(settings, args)
+        elif args.cmd == "scout":
+            cmd_scout(settings, args)
         elif args.cmd == "export":
             cmd_export(settings, args)
         elif args.cmd == "lines":

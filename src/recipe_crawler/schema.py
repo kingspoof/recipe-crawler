@@ -109,6 +109,38 @@ CREATE TABLE IF NOT EXISTS recipe_ingredients (
 );
 """
 
+# Site discovery (`scout`): new tables only, nothing existing changes.
+SCOUT_TABLES = """
+-- External hosts linked from crawled pages, counted once per page (written in batches during `crawl`).
+CREATE TABLE IF NOT EXISTS candidate_links (
+    host        TEXT NOT NULL,     -- as seen in the link, lowercase
+    from_domain TEXT NOT NULL,     -- the configured site whose page linked to it
+    pages       INTEGER NOT NULL,  -- pages of from_domain that link to host
+    first_seen  REAL,
+    last_seen   REAL,
+    PRIMARY KEY (host, from_domain)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS site_candidates (
+    domain       TEXT PRIMARY KEY,  -- host without "www."
+    host         TEXT NOT NULL,     -- host to probe (and to put in config.toml)
+    source       TEXT NOT NULL,     -- comma-separated: links, wdc
+    seen_count   INTEGER NOT NULL DEFAULT 0,  -- crawled pages linking to it
+    linked_sites INTEGER NOT NULL DEFAULT 0,  -- distinct crawled sites linking to it
+    wdc_entities INTEGER,                     -- Recipe entities in Web Data Commons
+    -- new | ok | links | blocked | no_recipes | unreachable | bad_data
+    status       TEXT NOT NULL DEFAULT 'new',
+    hit_rate     REAL,
+    est_urls     INTEGER,
+    language     TEXT,
+    mode         TEXT,              -- sitemaps | links
+    url_pattern  TEXT,              -- suggested, from the sample pages with recipes
+    probed_at    REAL,
+    notes        TEXT,
+    added_at     REAL NOT NULL
+);
+"""
+
 
 class SchemaTooNew(SystemExit):
     pass
@@ -153,6 +185,12 @@ def _v2_incomplete_discoveries(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE domains ADD COLUMN incomplete_discoveries INTEGER NOT NULL DEFAULT 0")
 
 
+def _v3_scout_tables(conn: sqlite3.Connection) -> None:
+    # CREATE TABLE IF NOT EXISTS: idempotent, and new empty tables only, so no backup needed
+    for stmt in statements(SCOUT_TABLES):
+        conn.execute(stmt)
+
+
 @dataclass(frozen=True)
 class Migration:
     version: int
@@ -164,6 +202,7 @@ class Migration:
 MIGRATIONS = [
     Migration(1, "baseline (crawler + ingredient tables, ingredient_lines.original)", _v1_baseline, backup=False),
     Migration(2, "domains.incomplete_discoveries", _v2_incomplete_discoveries, backup=False),
+    Migration(3, "scout tables: candidate_links, site_candidates", _v3_scout_tables, backup=False),
 ]
 CURRENT = len(MIGRATIONS)
 assert [m.version for m in MIGRATIONS] == list(range(1, CURRENT + 1))
