@@ -321,7 +321,7 @@ def test_migration_3_on_a_v2_database(tmp_path):
 
     calls = []
     db = DB(path, backup=lambda: calls.append(1))
-    assert schema.version(db.conn) == 3 and calls == []  # new empty tables only: no backup
+    assert schema.version(db.conn) == schema.CURRENT and calls == []  # new empty tables only: no backup
     assert schema.has_table(db.conn, "site_candidates") and schema.has_table(db.conn, "candidate_links")
     assert db.conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0] == 1
     db.conn.execute("INSERT INTO candidate_links VALUES ('a.de', 'x', 1, 0, 0)")

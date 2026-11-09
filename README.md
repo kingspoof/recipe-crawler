@@ -35,7 +35,9 @@ Stopping and restarting is safe: all state lives in SQLite.
 
 Every distinct ingredient line is turned into English name, amount and unit with Gemini, then mapped back to
 the recipes (`recipe_ingredients`: recipe_id = `recipes.id`, pos, line_id, name, amount, unit).
-This replaces `ingredient_processing.ipynb` (kept for reference only, don't run it next to the CLI).
+This replaced the notebooks (`ingredient_processing.ipynb` and the others, removed; see the git history).
+Schema v5 dropped their table `ingredients`; their columns on `recipes` (`ingredients_processed`,
+`recipes_ingredients_processed`, `ingredients_clean`, `detected_language`) are kept but not used by the code.
 
 ```bash
 uv run recipe-crawler lines            # collect new distinct lines into ingredient_lines (keeps done ones)
@@ -83,6 +85,54 @@ uv run recipe-crawler --log-file data.nosync/ingredients.log process   # log to 
   applied to `recipe_ingredients` by an UPDATE / DELETE per name (`--apply-only` does only that); `map` applies
   them to new rows. Merging cannot be undone in place: to split names again, change `ingredient_names` and run
   `map --full`.
+
+## Diet, food group and allergens (`classify`)
+
+```bash
+uv run recipe-crawler classify --dry-run   # ingredients without info yet, most used first
+uv run recipe-crawler classify             # classify them with Gemini (same quota and usage log as process)
+uv run recipe-crawler classify --report    # distribution per diet / food group / allergen, recipes by diet
+```
+
+- `ingredient_info` (one row per name in `recipe_ingredients`): `diet` = vegan | vegetarian (dairy, egg,
+  honey) | pescatarian (fish, seafood) | meat | unknown (only when the usual versions differ: unspecified
+  stock, broth, bouillon, mixed dishes), `food_group` (vegetable, fruit, grain, legume, nut_seed, dairy, egg,
+  meat, poultry, seafood, fat_oil, herb_spice, sweetener, sauce_condiment, beverage, alcohol, other) and
+  `allergens` (JSON list of the 14 EU allergens). Judged on the usual store-bought version: all cheese counts as
+  vegetarian, gelatin as meat, honey as vegetarian, Worcestershire / oyster / fish sauce as pescatarian.
+- Only names without a row are sent, so run it after `names` every day. `model = 'manual'` marks rows fixed by
+  hand. To redo one: delete its row and run `classify` again.
+- **Recipes**: a recipe is as restrictive as its least restrictive ingredient (meat > pescatarian > vegetarian >
+  vegan); an unknown or unclassified ingredient, or a line not processed yet, makes it unknown (unless it already
+  has meat). Not a view (a view on `recipe_ingredients` breaks the table swap of `map --full`), but the queries
+  `classify.RECIPE_DIET_SQL` / `RECIPE_ALLERGENS_SQL` and the functions `recipe_diets()` / `recipe_allergens()`.
+- First run (2026-11-09): recipes 13.9% vegan, 36.3% vegetarian, 12.2% pescatarian, 35.0% meat, 2.6% unknown.
+
+## Ingredient graph (networkx)
+
+`graph` writes an ingredient co-occurrence graph from `recipe_ingredients` (with the merged names) as GraphML.
+It only reads the database, so it can run next to everything else.
+
+```bash
+uv run recipe-crawler graph data.nosync/ingredients.graphml                     # all recipes
+uv run recipe-crawler graph data.nosync/asia.graphml --region "East Asia" --region "Southeast Asia"
+uv run recipe-crawler graph data.nosync/de.graphml --language de --exclude salt --exclude water
+```
+
+- **Nodes**: ingredients used in at least `--min-recipes` recipes (default 20), with `recipes` (count) and
+  `share` (of the recipes counted). **Edges**: pairs used together in at least `--min-weight` recipes (default
+  10), with `weight` (recipes using both), `pmi` = log(P(a,b) / P(a)P(b)) and `npmi` (pmi normalized to [-1, 1];
+  better than `weight` for "goes together", which is dominated by salt, garlic and onion).
+- Once `classify` ran, nodes also have `diet`, `food_group` and `allergens` (comma-separated, `""` = none).
+- Filters: `--region`, `--country`, `--language` (`de` also matches `de-CH`), `--domain`, `--diet`, all repeatable;
+  `--exclude` leaves an ingredient out. The graph attributes record the filters and thresholds.
+- All recipes with the defaults: ~7.4K nodes, ~280K edges, 49 MB, 15 s, < 1 GB RAM.
+
+```python
+import networkx as nx
+g = nx.read_graphml("data.nosync/ingredients.graphml")
+sorted(g["cilantro"].items(), key=lambda e: -e[1]["npmi"])[:5]   # what goes with cilantro
+```
 
 ## Database safety
 

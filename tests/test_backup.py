@@ -34,7 +34,7 @@ def test_daily_has_only_the_precious_tables_and_is_consistent(live, cfg, tmp_pat
     raw.write_bytes(gzip.decompress(path.read_bytes()))
     con = sqlite3.connect(raw)
     tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    assert tables == {"ingredient_lines", "ingredient_names", "domains"}
+    assert tables == {"ingredient_lines", "ingredient_names", "ingredient_info", "domains"}
     assert con.execute("SELECT line, status, items FROM ingredient_lines").fetchall() == [("salt", 1, "[]")]
     assert "ingredient_lines_todo" in {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
     con.close()
@@ -177,4 +177,13 @@ def test_tables_size_counts_the_indexes(live, tmp_path):
     con = sqlite3.connect(tmp_path / "data" / "r.db")
     table_only = con.execute("SELECT SUM(pgsize) FROM dbstat WHERE name = 'ingredient_lines'").fetchone()[0]
     assert backup._tables_size(con, ("ingredient_lines",)) > 1.5 * table_only  # + UNIQUE(line) + the todo index
+    con.close()
+
+
+def test_full_backup_leaves_no_wal_files(live, cfg, tmp_path):
+    path = backup.full(tmp_path / "data" / "r.db", cfg)
+    backup.check(cfg)  # opens the backups read-only, like quick_check
+    assert sorted(p.name for p in cfg.dir.iterdir() if p.name.startswith("full-")) == [path.name]
+    con = sqlite3.connect(path)
+    assert con.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     con.close()

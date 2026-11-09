@@ -143,6 +143,9 @@ def full(db_path: Path, cfg: BackupSettings) -> Path:
     dst = sqlite3.connect(tmp)
     try:
         src.backup(dst)  # pages=-1: everything in one step, so the copy is one consistent snapshot
+        # The copy inherits WAL mode; opened read-only later (quick_check, `check`), a WAL file leaves -shm /
+        # -wal files behind. A restored copy is switched back to WAL when DB() opens it.
+        dst.execute("PRAGMA journal_mode = DELETE")
     finally:
         dst.close()
         src.close()
