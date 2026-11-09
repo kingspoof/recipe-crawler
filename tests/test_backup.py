@@ -34,7 +34,7 @@ def test_daily_has_only_the_precious_tables_and_is_consistent(live, cfg, tmp_pat
     raw.write_bytes(gzip.decompress(path.read_bytes()))
     con = sqlite3.connect(raw)
     tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    assert tables == {"ingredient_lines", "ingredient_names", "domains"}
+    assert tables == {"ingredient_lines", "ingredient_names", "ingredient_info", "domains"}
     assert con.execute("SELECT line, status, items FROM ingredient_lines").fetchall() == [("salt", 1, "[]")]
     assert "ingredient_lines_todo" in {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
     con.close()

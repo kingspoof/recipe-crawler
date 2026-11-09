@@ -142,6 +142,18 @@ CREATE TABLE IF NOT EXISTS site_candidates (
 """
 
 
+INGREDIENT_INFO = """
+CREATE TABLE IF NOT EXISTS ingredient_info (
+    name       TEXT PRIMARY KEY,  -- recipe_ingredients.name (canonical)
+    diet       TEXT NOT NULL,     -- vegan | vegetarian | pescatarian | meat | unknown
+    food_group TEXT NOT NULL,     -- classify.FOOD_GROUPS
+    allergens  TEXT NOT NULL,     -- JSON list of classify.ALLERGENS (the 14 EU allergens), [] = none
+    model      TEXT,
+    done_at    REAL
+);
+"""
+
+
 class SchemaTooNew(SystemExit):
     pass
 
@@ -191,6 +203,12 @@ def _v3_scout_tables(conn: sqlite3.Connection) -> None:
         conn.execute(stmt)
 
 
+def _v4_ingredient_info(conn: sqlite3.Connection) -> None:
+    # a new empty table: idempotent, no backup needed
+    for stmt in statements(INGREDIENT_INFO):
+        conn.execute(stmt)
+
+
 @dataclass(frozen=True)
 class Migration:
     version: int
@@ -203,6 +221,7 @@ MIGRATIONS = [
     Migration(1, "baseline (crawler + ingredient tables, ingredient_lines.original)", _v1_baseline, backup=False),
     Migration(2, "domains.incomplete_discoveries", _v2_incomplete_discoveries, backup=False),
     Migration(3, "scout tables: candidate_links, site_candidates", _v3_scout_tables, backup=False),
+    Migration(4, "ingredient_info (diet, food group, allergens per ingredient)", _v4_ingredient_info, backup=False),
 ]
 CURRENT = len(MIGRATIONS)
 assert [m.version for m in MIGRATIONS] == list(range(1, CURRENT + 1))

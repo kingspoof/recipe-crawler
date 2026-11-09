@@ -6,6 +6,7 @@ Edges join two ingredients used in the same recipe:
 - weight: how many recipes use both,
 - pmi: log(P(a, b) / (P(a) P(b))), > 0 = together more often than chance,
 - npmi: pmi / -log P(a, b), in [-1, 1], comparable between frequent and rare pairs.
+Once `classify` ran, nodes also get diet, food_group and allergens (comma-separated, "" = none).
 Graph attributes: recipes (counted), the filters and thresholds used, created_at.
 
 Only recipes with at least one mapped ingredient count. An ingredient is counted once per recipe, also when it
@@ -26,6 +27,8 @@ from pathlib import Path
 import networkx as nx
 import numpy as np
 
+from . import classify
+
 log = logging.getLogger("graph")
 
 PAIRS_CHUNK = 20_000_000  # pair codes collected before they are reduced to (pair, count): keeps memory flat
@@ -39,11 +42,13 @@ class GraphOptions:
     countries: list[str] = field(default_factory=list)  # recipes.site_country
     languages: list[str] = field(default_factory=list)  # recipes.language (prefix: "de" matches "de-CH")
     domains: list[str] = field(default_factory=list)  # recipes.domain
+    diets: list[str] = field(default_factory=list)  # recipe diet (classify.recipe_diets), e.g. vegan
     exclude: list[str] = field(default_factory=list)  # ingredient names left out (e.g. "salt", "water")
 
     def filters(self) -> dict[str, str]:
         return {k: ", ".join(v) for k, v in (("regions", self.regions), ("countries", self.countries),
-                                             ("languages", self.languages), ("domains", self.domains)) if v}
+                                             ("languages", self.languages), ("domains", self.domains),
+                                             ("diets", self.diets)) if v}
 
 
 def _recipe_filter(opts: GraphOptions) -> tuple[str, list[str]]:
@@ -66,6 +71,10 @@ def recipe_ingredient_sets(conn: sqlite3.Connection, opts: GraphOptions) -> tupl
     wanted = None
     if where:  # a set of ids, so recipe_ingredients is still read in one pass in recipe_id order
         wanted = {id for (id,) in conn.execute(f"SELECT id FROM recipes WHERE {where}", params)}
+    if opts.diets:
+        by_diet = {id for id, diet in classify.recipe_diets(conn).items() if diet in opts.diets}
+        wanted = by_diet if wanted is None else wanted & by_diet
+    if wanted is not None:
         log.info("%s recipes match the filters", f"{len(wanted):,}")
     excluded = set(opts.exclude)
     index: dict[str, int] = {}
@@ -146,8 +155,13 @@ def build_graph(conn: sqlite3.Connection, opts: GraphOptions) -> nx.Graph:
 
     g = nx.Graph(recipes=total, min_recipes=opts.min_recipes, min_weight=opts.min_weight,
                  exclude=", ".join(opts.exclude), created_at=time.strftime("%Y-%m-%d %H:%M:%S"), **opts.filters())
-    for k, i in enumerate(kept):
-        g.add_node(names[i], recipes=int(uses[i]), share=float(uses[i] / total))
+    known = classify.info(conn)
+    for i in kept:
+        attrs = {"recipes": int(uses[i]), "share": float(uses[i] / total)}
+        if names[i] in known:
+            diet, group, allergens = known[names[i]]
+            attrs.update(diet=diet, food_group=group, allergens=",".join(allergens))
+        g.add_node(names[i], **attrs)
     ka, kb = uses[kept[a]], uses[kept[b]]
     pmi = np.log(w * total / (ka * kb))
     joint = w / total

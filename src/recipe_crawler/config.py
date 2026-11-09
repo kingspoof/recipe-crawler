@@ -83,8 +83,8 @@ class ScoutSettings:
 class BackupSettings:
     """[backup] in config.toml. dir is required for `backup` (no default, so nothing lands in a synced folder)."""
 
-    # Cannot be rebuilt cheaply: the Gemini answers (quota), canonical names, discovery state.
-    DAILY_TABLES = ("ingredient_lines", "ingredient_names", "domains")
+    # Cannot be rebuilt cheaply: the Gemini answers (quota), canonical names, ingredient info, discovery state.
+    DAILY_TABLES = ("ingredient_lines", "ingredient_names", "ingredient_info", "domains")
 
     dir: Path | None = None
     daily_keep: int = 14

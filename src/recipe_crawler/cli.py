@@ -25,7 +25,7 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import backup, gemini, graph, ingredients, scout
+from . import backup, classify, gemini, graph, ingredients, scout
 from .config import Settings, Site, load_config
 from .crawler import Crawler
 from .db import DB, single_instance
@@ -250,7 +250,7 @@ def cmd_map(settings: Settings, args: argparse.Namespace) -> None:
 def cmd_graph(settings: Settings, args: argparse.Namespace) -> None:
     opts = graph.GraphOptions(min_recipes=args.min_recipes, min_weight=args.min_weight, regions=args.region or [],
                               countries=args.country or [], languages=args.language or [], domains=args.domain or [],
-                              exclude=args.exclude or [])
+                              diets=args.diet or [], exclude=args.exclude or [])
     db = DB(settings.db_path, readonly=True)
     try:
         g = graph.build_graph(db.conn, opts)
@@ -258,6 +258,28 @@ def cmd_graph(settings: Settings, args: argparse.Namespace) -> None:
         db.close()
     graph.write_graph(g, args.output)
     print("\n".join(graph.summary(g)))
+
+
+def cmd_classify(settings: Settings, args: argparse.Namespace) -> None:
+    if args.report or args.dry_run:  # read only: no migrations, no requests
+        db = DB(settings.db_path, readonly=True)
+        try:
+            print("\n".join(classify.report(db.conn) if args.report else classify.dry_run(db.conn, args.verbose)))
+        finally:
+            db.close()
+        return
+    keys, usage = _gemini_args(settings, args)
+    cfg = classify.settings(settings.ingredients)
+    db = open_db(settings)
+    try:
+        classify.apply_spool(db.conn, cfg)
+        lanes = ingredients.build_lanes(cfg, keys, usage, usage.used_today(keys))
+        processor = gemini.Processor(cfg, lanes, usage, classify.make_save(db.conn), max_requests=args.max_requests,
+                                     spool=classify.spool_path(cfg), task=classify.TASK)
+        _stop_on_signals(processor)
+        processor.run(classify.todo(db.conn))
+    finally:
+        db.close()
 
 
 def cmd_names(settings: Settings, args: argparse.Namespace) -> None:
@@ -361,6 +383,13 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--max-requests", type=int, help="stop after this many requests in total (for testing)")
     sp.add_argument("--dry-run", action="store_true", help="only print what it would send")
 
+    sp = sub.add_parser("classify", help="diet, food group and allergens per ingredient with Gemini (ingredient_info)")
+    sp.add_argument("--keys", help="keys file (default: ingredients.keys_file)")
+    sp.add_argument("--model", action="append", help="model (repeatable, default: ingredients.models)")
+    sp.add_argument("--max-requests", type=int, help="stop after this many requests in total (for testing)")
+    sp.add_argument("--dry-run", action="store_true", help="only print what it would send")
+    sp.add_argument("--report", action="store_true", help="only print the progress and the distribution")
+
     sp = sub.add_parser("graph", help="ingredient co-occurrence graph as GraphML for networkx (read only)")
     sp.add_argument("output", help="file to write, e.g. data.nosync/ingredients.graphml")
     sp.add_argument("--min-recipes", type=int, default=graph.GraphOptions.min_recipes,
@@ -371,6 +400,8 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--country", action="append", help="only recipes of this site_country (repeatable)")
     sp.add_argument("--language", action="append", help="only recipes in this language, e.g. de (repeatable)")
     sp.add_argument("--domain", action="append", help="only recipes of this site (repeatable)")
+    sp.add_argument("--diet", action="append", choices=classify.DIETS,
+                    help="only recipes with this diet, from `classify` (repeatable)")
     sp.add_argument("--exclude", action="append", help="leave out this ingredient, e.g. salt (repeatable)")
 
     sp = sub.add_parser("map", help="map processed lines back to recipe_ingredients (incremental)")
@@ -414,7 +445,8 @@ def main(argv: list[str] | None = None) -> None:
     instance = {"discover": "crawl", "crawl": "crawl", "lines": "lines", "map": "map", "backup": "backup",
                 "scout": "scout",
                 "process": None if read_only else "process",
-                "names": None if read_only else "map"}.get(args.cmd)
+                "names": None if read_only else "map",
+                "classify": None if read_only else "classify"}.get(args.cmd)
     lock = single_instance(settings.db_path, instance) if instance else None
     try:
         if args.cmd == "probe":
@@ -439,6 +471,8 @@ def main(argv: list[str] | None = None) -> None:
             cmd_names(settings, args)
         elif args.cmd == "graph":
             cmd_graph(settings, args)
+        elif args.cmd == "classify":
+            cmd_classify(settings, args)
         elif args.cmd == "backup":
             cmd_backup(settings, args)
         elif args.cmd == "check":
