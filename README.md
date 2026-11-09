@@ -35,7 +35,9 @@ Stopping and restarting is safe: all state lives in SQLite.
 
 Every distinct ingredient line is turned into English name, amount and unit with Gemini, then mapped back to
 the recipes (`recipe_ingredients`: recipe_id = `recipes.id`, pos, line_id, name, amount, unit).
-This replaces `ingredient_processing.ipynb` (kept for reference only, don't run it next to the CLI).
+This replaced the notebooks (`ingredient_processing.ipynb` and the others, removed; see the git history).
+Schema v5 dropped their table `ingredients`; their columns on `recipes` (`ingredients_processed`,
+`recipes_ingredients_processed`, `ingredients_clean`, `detected_language`) are kept but not used by the code.
 
 ```bash
 uv run recipe-crawler lines            # collect new distinct lines into ingredient_lines (keeps done ones)

@@ -132,5 +132,5 @@ def test_migration_4_adds_the_table(tmp_path):
     con.close()
     calls = []
     db = DB(path, backup=lambda: calls.append(1))
-    assert schema.version(db.conn) == 4 and calls == [] and schema.has_table(db.conn, "ingredient_info")
+    assert schema.version(db.conn) == schema.CURRENT and calls == [] and schema.has_table(db.conn, "ingredient_info")
     db.close()

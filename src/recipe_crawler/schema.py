@@ -5,7 +5,8 @@ together with the version bump, so a crash leaves the database at the old or the
 
 - A database newer than this code is refused for writing (an old checkout must not touch a migrated DB).
 - Read-only commands never migrate (see DB(readonly=True)).
-- Migrations marked `backup` get a full backup first (`recipe-crawler backup --full`), if there is data.
+- Migrations marked `backup` get a full backup first (`recipe-crawler backup --full`), if there is data
+  (`backup` can be a function: only when this database has what the migration deletes).
 - Version 1 is the baseline: the layout the crawler and ingredient_processing.ipynb created, plus
   ingredient_lines.original. On the existing database it only adds what is missing, so nothing is reprocessed.
 
@@ -203,6 +204,12 @@ def _v3_scout_tables(conn: sqlite3.Connection) -> None:
         conn.execute(stmt)
 
 
+def _v5_drop_legacy_ingredients(conn: sqlite3.Connection) -> None:
+    # `ingredients` was written by ingredient_splitting.ipynb (one row per line, never translated) and is
+    # replaced by ingredient_lines + recipe_ingredients. Deletes data: full backup first.
+    conn.execute("DROP TABLE IF EXISTS ingredients")
+
+
 def _v4_ingredient_info(conn: sqlite3.Connection) -> None:
     # a new empty table: idempotent, no backup needed
     for stmt in statements(INGREDIENT_INFO):
@@ -214,7 +221,11 @@ class Migration:
     version: int
     description: str
     apply: Callable[[sqlite3.Connection], None]
-    backup: bool = True  # take a full backup first (if the database has data)
+    # take a full backup first (if the database has data); a function decides per database
+    backup: bool | Callable[[sqlite3.Connection], bool] = True
+
+    def needs_backup(self, conn: sqlite3.Connection) -> bool:
+        return self.backup(conn) if callable(self.backup) else self.backup
 
 
 MIGRATIONS = [
@@ -222,6 +233,8 @@ MIGRATIONS = [
     Migration(2, "domains.incomplete_discoveries", _v2_incomplete_discoveries, backup=False),
     Migration(3, "scout tables: candidate_links, site_candidates", _v3_scout_tables, backup=False),
     Migration(4, "ingredient_info (diet, food group, allergens per ingredient)", _v4_ingredient_info, backup=False),
+    Migration(5, "drop the legacy notebook table `ingredients`", _v5_drop_legacy_ingredients,
+              backup=lambda conn: has_table(conn, "ingredients")),
 ]
 CURRENT = len(MIGRATIONS)
 assert [m.version for m in MIGRATIONS] == list(range(1, CURRENT + 1))
@@ -256,7 +269,7 @@ def migrate(conn: sqlite3.Connection, backup: Callable[[], object] | None = None
     todo = pending(conn)
     if not todo:
         return 0
-    if any(m.backup for m in todo) and has_data(conn):
+    if any(m.needs_backup(conn) for m in todo) and has_data(conn):
         if backup is None:
             raise SystemExit(f"Schema migration to version {CURRENT} needs a full backup first: set [backup] dir "
                              "in config.toml (outside iCloud).")

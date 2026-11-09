@@ -178,3 +178,12 @@ def test_tables_size_counts_the_indexes(live, tmp_path):
     table_only = con.execute("SELECT SUM(pgsize) FROM dbstat WHERE name = 'ingredient_lines'").fetchone()[0]
     assert backup._tables_size(con, ("ingredient_lines",)) > 1.5 * table_only  # + UNIQUE(line) + the todo index
     con.close()
+
+
+def test_full_backup_leaves_no_wal_files(live, cfg, tmp_path):
+    path = backup.full(tmp_path / "data" / "r.db", cfg)
+    backup.check(cfg)  # opens the backups read-only, like quick_check
+    assert sorted(p.name for p in cfg.dir.iterdir() if p.name.startswith("full-")) == [path.name]
+    con = sqlite3.connect(path)
+    assert con.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    con.close()

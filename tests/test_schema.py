@@ -113,3 +113,22 @@ def test_every_migration_is_idempotent(tmp_path):
     for m in schema.MIGRATIONS:
         m.apply(db.conn)  # again, on a database that already has everything
     db.close()
+
+
+def test_migration_5_drops_the_legacy_table_after_a_backup(tmp_path):
+    path = tmp_path / "r.db"
+    con = sqlite3.connect(path, isolation_level=None)
+    for m in schema.MIGRATIONS[:4]:
+        m.apply(con)
+    con.execute("PRAGMA user_version = 4")
+    con.execute("CREATE TABLE ingredients (id INTEGER PRIMARY KEY AUTOINCREMENT, recipe_url TEXT NOT NULL, "
+                "original_desc TEXT NOT NULL, ingredient_eng TEXT, amount TEXT, unit TEXT)")
+    con.execute("INSERT INTO ingredients (recipe_url, original_desc) VALUES ('https://x/1', '1 egg')")
+    con.execute("INSERT INTO urls (url, domain) VALUES ('https://x/1', 'x')")
+    con.close()
+    calls = []
+    db = DB(path, backup=lambda: calls.append(1))
+    assert calls == [1] and schema.version(db.conn) == 5 and not schema.has_table(db.conn, "ingredients")
+    assert db.conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0] == 1
+    db.close()
+    schema.MIGRATIONS[4].apply(sqlite3.connect(path))  # idempotent: no table, no error
