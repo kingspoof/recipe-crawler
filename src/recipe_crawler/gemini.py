@@ -107,7 +107,7 @@ class Reply:
 
 
 class Client(Protocol):
-    def generate(self, model: str, contents: str, cfg: IngredientSettings) -> Reply: ...
+    def generate(self, model: str, contents: str, cfg: IngredientSettings, schema: dict = RESPONSE_SCHEMA) -> Reply: ...
 
 
 class GeminiClient:
@@ -118,14 +118,14 @@ class GeminiClient:
 
         self._client = genai.Client(api_key=api_key)
 
-    def generate(self, model: str, contents: str, cfg: IngredientSettings) -> Reply:
+    def generate(self, model: str, contents: str, cfg: IngredientSettings, schema: dict = RESPONSE_SCHEMA) -> Reply:
         from google.genai import errors, types
 
         config = types.GenerateContentConfig(
             temperature=0,
             max_output_tokens=cfg.max_output_tokens,
             response_mime_type="application/json",
-            response_json_schema=RESPONSE_SCHEMA,
+            response_json_schema=schema,
             thinking_config=types.ThinkingConfig(thinking_level=cfg.thinking_level) if cfg.thinking_level else None,
         )
         try:
@@ -227,15 +227,18 @@ def transient(rec: dict) -> bool:
 
 def call(client: Client, key: str, model: str, lines: list[str], cfg: IngredientSettings, usage: UsageLog,
          sleep: Callable[[float], Any] = time.sleep, retry_wait: float = RETRY_WAIT,
-         max_retries: int = MAX_RETRIES) -> tuple[Any, dict]:
+         max_retries: int = MAX_RETRIES, task: Task | None = None) -> tuple[Any, dict]:
     """Returns (parsed JSON or None, record). Runs in a worker thread, never touches the database."""
+    task = task or LINES
     payload = json.dumps([[i, line] for i, line in enumerate(lines)], ensure_ascii=False)
     rec: dict[str, Any] = {"day": quota_day(), "key": key, "model": model, "thinking": cfg.thinking_level,
                            "lines": len(lines)}
+    if task is not LINES:
+        rec["task"] = task.name
     for attempt in range(max_retries + 1):
         t = time.time()
         try:
-            reply = client.generate(model, PROMPT + payload, cfg)
+            reply = client.generate(model, task.prompt + payload, cfg, task.schema)
             break
         except ApiError as e:
             rec.update(ts=time.time(), latency=time.time() - t, retries=attempt, error=f"{e.code} {e.message}"[:300])
@@ -289,6 +292,20 @@ def parse(n_lines: int, result: Any) -> dict[int, list]:
         if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n_lines:
             out.setdefault(i, []).append([item.get("en"), item.get("a"), item.get("u")])
     return out
+
+
+@dataclass(frozen=True)
+class Task:
+    """What a request asks for: the prompt (the JSON array of [index, text] is appended), the response schema,
+    and parse(n, result) -> {index: answer} for every index answered. The answer is passed to save as it is."""
+
+    name: str
+    prompt: str
+    schema: dict
+    parse: Callable[[int, Any], dict[int, Any]]
+
+
+LINES = Task("lines", PROMPT, RESPONSE_SCHEMA, parse)
 
 
 # --------------------------------------------------------------------------- lanes and the scheduler
@@ -349,7 +366,7 @@ class Lane:
 
 @dataclass
 class Line:
-    id: int
+    id: Any  # ingredient_lines.id, or the name itself for the names task
     text: str  # what is sent: the original spelling if there is one, else the lowercase key
     attempts: int = 0  # times the model left it out so far
     server_errors: int = 0  # 5xx blamed on this line alone (batch of one, others succeeded in between)
@@ -394,8 +411,9 @@ class Processor:
     def __init__(self, cfg: IngredientSettings, lanes: list[Lane], usage: UsageLog, save: SaveFn,
                  max_requests: int | None = None, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], Any] | None = None, retry_sleep: Callable[[float], Any] = time.sleep,
-                 retry_wait: float = RETRY_WAIT, spool: Path | None = None):
+                 retry_wait: float = RETRY_WAIT, spool: Path | None = None, task: Task = LINES):
         self.cfg, self.lanes, self.usage, self._save_fn = cfg, lanes, usage, save
+        self.task = task
         self.spool = spool  # where answers go when the database cannot take them
         self.max_requests = max_requests
         self.clock = clock
@@ -451,6 +469,7 @@ class Processor:
         cfg = self.cfg
         todo, retry = deque(todo_lines), deque[Line]()  # retry: left out by the model, or the request failed
         total = len(todo)
+        self.done = self.failed = 0  # per run (a Processor can run several times); sent counts for max_requests
         start = self.clock()
         for i, lane in enumerate(self.lanes):  # not every key at the same moment
             lane.next_at = start + i * cfg.stagger
@@ -485,7 +504,8 @@ class Processor:
                         self.sent += 1
                         lane.next_at = now + 1.05 * 60 / cfg.rpm
                         futures[pool.submit(call, lane.client, lane.key, lane.model, [b.text for b in batch], cfg,
-                                            self.usage, self.retry_sleep, self.retry_wait)] = (lane, batch)
+                                            self.usage, self.retry_sleep, self.retry_wait,
+                                            task=self.task)] = (lane, batch)
                 for lane in self.lanes:
                     lane.check_quota()
                 if not futures:
@@ -571,7 +591,7 @@ class Processor:
         if line.server_errors < MAX_TRANSIENT:
             retry.appendleft(line)
             return
-        log.warning("%s: line %d keeps getting %s on its own: giving up (status %d)", lane.name, line.id,
+        log.warning("%s: line %s keeps getting %s on its own: giving up (status %d)", lane.name, line.id,
                     error[:60], GAVE_UP)
         self.save([], [], lane.model, [line.id])
         self.failed += 1
@@ -602,7 +622,7 @@ class Processor:
                 return
             self._server_error(lane, batch, error, retry, todo if todo is not None else retry)
             return
-        parsed = parse(len(batch), result)
+        parsed = self.task.parse(len(batch), result)
         # Cut off at MAX_TOKENS: the lines after the cut were never reached, so they are not charged. The line
         # at the cut is (it may be the one that makes the answer explode), and so are gaps before it.
         cut = max(parsed, default=-1) + 1 if "truncated" in rec else len(batch)

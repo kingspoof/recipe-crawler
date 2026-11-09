@@ -192,18 +192,35 @@ def cmd_lines(settings: Settings, args: argparse.Namespace) -> None:
     db.close()
 
 
-def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
+def _gemini_args(settings: Settings, args: argparse.Namespace) -> tuple[list[str], gemini.UsageLog]:
+    """Applies the command line overrides; returns the keys and the usage log."""
     cfg = settings.ingredients
     for name in ("batch_size", "rpm"):
-        if getattr(args, name):
+        if getattr(args, name, None):
             setattr(cfg, name, getattr(args, name))
     if args.model:
         cfg.models = args.model
     keys_file = args.keys or cfg.keys_file
     if not os.path.exists(keys_file):
         raise SystemExit(f"No keys file {keys_file}: one Gemini API key per line, one key per project.")
-    keys = gemini.load_keys(keys_file)
-    usage = gemini.UsageLog(cfg.usage_log)
+    return gemini.load_keys(keys_file), gemini.UsageLog(cfg.usage_log)
+
+
+def _stop_on_signals(processor: gemini.Processor) -> None:
+    def stop(*_: object) -> None:
+        if processor.stopping:
+            logging.error("Aborting without waiting for the requests in flight.")
+            os._exit(1)  # the worker threads would keep the interpreter alive; saved data is already committed
+        logging.warning("Stopping: waiting for the requests in flight and saving them (Ctrl+C again to abort)...")
+        processor.stop()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+
+def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
+    cfg = settings.ingredients
+    keys, usage = _gemini_args(settings, args)
     used = usage.used_today(keys)
     if args.dry_run:  # no migrations, no requests, no usage records
         db = DB(settings.db_path, readonly=True)
@@ -217,16 +234,7 @@ def cmd_process(settings: Settings, args: argparse.Namespace) -> None:
     lanes = ingredients.build_lanes(cfg, keys, usage, used)
     processor = gemini.Processor(cfg, lanes, usage, ingredients.make_save(db.conn), max_requests=args.max_requests,
                                  spool=ingredients.spool_path(cfg))
-
-    def stop(*_: object) -> None:
-        if processor.stopping:
-            logging.error("Aborting without waiting for the requests in flight.")
-            os._exit(1)  # the worker threads would keep the interpreter alive; saved data is already committed
-        logging.warning("Stopping: waiting for the requests in flight and saving them (Ctrl+C again to abort)...")
-        processor.stop()
-
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
+    _stop_on_signals(processor)
     try:
         processor.run(ingredients.todo_lines(db.conn))
     finally:
@@ -240,9 +248,35 @@ def cmd_map(settings: Settings, args: argparse.Namespace) -> None:
 
 
 def cmd_names(settings: Settings, args: argparse.Namespace) -> None:
-    db = DB(settings.db_path, readonly=True)
-    print("\n".join(ingredients.names_report(db.conn)))
-    db.close()
+    if args.report or args.dry_run:  # read only: no migrations, no requests
+        db = DB(settings.db_path, readonly=True)
+        try:
+            if args.report:
+                print("\n".join(ingredients.names_report(db.conn)))
+            else:
+                print("\n".join(ingredients.names_dry_run(db.conn, settings.ingredients, show_prompt=args.verbose)))
+        finally:
+            db.close()
+        return
+    keys, usage = _gemini_args(settings, args)
+    cfg = ingredients.names_settings(settings.ingredients)
+    db = open_db(settings)
+    try:
+        if not args.apply_only:
+            ingredients.apply_names_spool(db.conn, cfg)
+            lanes = ingredients.build_lanes(cfg, keys, usage, usage.used_today(keys))
+            processor = gemini.Processor(cfg, lanes, usage, ingredients.make_save_names(db.conn),
+                                         max_requests=args.max_requests, spool=ingredients.names_spool_path(cfg),
+                                         task=ingredients.NAMES)
+            _stop_on_signals(processor)
+            counts = ingredients.name_counts(db.conn)
+            for _ in range(ingredients.NAMES_ROUNDS):  # later rounds: canonical names the model invented
+                todo = ingredients.todo_names(db.conn, counts)
+                if not todo or processor.run(todo) != "done":
+                    break
+        ingredients.apply_names(db.conn)
+    finally:
+        db.close()
 
 
 # --------------------------------------------------------------------------- backup / check
@@ -317,7 +351,14 @@ def main(argv: list[str] | None = None) -> None:
     sp = sub.add_parser("map", help="map processed lines back to recipe_ingredients (incremental)")
     sp.add_argument("--full", action="store_true", help="drop and rebuild recipe_ingredients")
 
-    sub.add_parser("names", help="(next step, stub) standardize ingredient names via ingredient_names")
+    sp = sub.add_parser("names", help="merge ingredient names with Gemini (ingredient_names) and apply them")
+    sp.add_argument("--keys", help="keys file (default: ingredients.keys_file)")
+    sp.add_argument("--model", action="append", help="model (repeatable, default: ingredients.models)")
+    sp.add_argument("--max-requests", type=int, help="stop after this many requests in total (for testing)")
+    sp.add_argument("--dry-run", action="store_true", help="only print what it would send")
+    sp.add_argument("--report", action="store_true", help="only print the progress and the biggest merges")
+    sp.add_argument("--apply-only", action="store_true", help="no requests: only apply ingredient_names to "
+                                                               "recipe_ingredients")
 
     sp = sub.add_parser("backup", help="daily backup of the irreplaceable tables, a full one when due")
     sp.add_argument("--full", action="store_true", help="also take a full backup now")
@@ -342,10 +383,13 @@ def main(argv: list[str] | None = None) -> None:
     settings = load_config(args.config, require_contact=args.cmd in ("probe", "discover", "crawl")
                            or (args.cmd == "scout" and bool(args.probe)))
 
-    # One instance per command and database (discover and crawl count as one).
+    # One instance per command and database (discover and crawl count as one; names and map both rewrite
+    # recipe_ingredients, so they count as one too).
+    read_only = getattr(args, "dry_run", False) or getattr(args, "report", False)
     instance = {"discover": "crawl", "crawl": "crawl", "lines": "lines", "map": "map", "backup": "backup",
                 "scout": "scout",
-                "process": None if getattr(args, "dry_run", False) else "process"}.get(args.cmd)
+                "process": None if read_only else "process",
+                "names": None if read_only else "map"}.get(args.cmd)
     lock = single_instance(settings.db_path, instance) if instance else None
     try:
         if args.cmd == "probe":
